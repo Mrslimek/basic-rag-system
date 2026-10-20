@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     # intfloat/multilingual-e5-small produces 384-dimensional dense vectors
     EMBEDDING_MODEL_NAME: str = "intfloat/multilingual-e5-small"
     EMBEDDING_DIMENSION: int = 384
+    HF_CACHE_DIR: Path | None = Path.home() / "Projects" / "AI" / "models" / "hub"
     
     # Local Docs Directory scanned by Taskiq worker
     DOCS_DIR: Path = Path(__file__).resolve().parent.parent / "docs_mock"

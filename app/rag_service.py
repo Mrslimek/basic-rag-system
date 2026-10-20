@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.embeddings import embedding_service
+from app.embeddings import embedding_service, EmbeddingService
 from app.models import Service, ServiceDocumentationChunk
 
 
@@ -24,8 +24,8 @@ class RAGService:
     4. Formats context with clear provenance boundaries for the downstream LLM.
     """
 
-    def __init__(self, embedding_provider=embedding_service) -> None:
-        self.embeddings = embedding_provider
+    def __init__(self, embedding_provider: EmbeddingService = embedding_service) -> None:
+        self.embeddings: EmbeddingService = embedding_provider
 
     async def retrieve_chunks(
         self,

@@ -7,7 +7,7 @@ settings = get_settings()
 BACKEND_CHAT_URL = f"{settings.BACKEND_API_URL.rstrip('/')}/chat"
 
 st.set_page_config(
-    page_title="Microservices Docs RAG",´
+    page_title="Microservices Docs RAG",
     page_icon="🤖",
     layout="centered",
 )
