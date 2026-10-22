@@ -6,7 +6,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    Text,
+    Text, UniqueConstraint, CheckConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -98,3 +98,144 @@ class ServiceDocumentationChunk(Base):
             postgresql_ops={"embedding": "vector_ip_ops"},
         ),
     )
+
+
+# --- Graph layer: canonical nodes, deduplicated edges, per-chunk evidence ---
+
+
+class GraphEntity(Base):
+    """
+    Canonical graph node produced by entity resolution across chunks.
+
+    `canonical_name` stores the normalized surface form (lowercased, trimmed);
+    raw variants live in EntityAlias, so a wrong merge is corrected by editing
+    one alias row instead of rewriting edges.
+    """
+    __tablename__ = "graph_entities"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    canonical_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    aliases: Mapped[list["EntityAlias"]] = relationship(
+        "EntityAlias", back_populates="entity", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        # Identity is (name, type): the same string may be both a service and a
+        # database, and those must stay distinct nodes (type guard, lesson 3).
+        UniqueConstraint("canonical_name", "entity_type", name="uq_graph_entities_name_type"),
+    )
+
+
+class EntityAlias(Base):
+    """
+    A surface form ("AuthService", "payments-svc") pointing at its canonical node.
+
+    Lookup by `normalized` is the hot path for indexing (merge decisions) and
+    retrieval (query entity -> start node).
+    """
+    __tablename__ = "entity_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    alias: Mapped[str] = mapped_column(String(300), nullable=False)
+    normalized: Mapped[str] = mapped_column(String(300), nullable=False, index=True)
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("graph_entities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("service_documentation_chunks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    entity: Mapped["GraphEntity"] = relationship("GraphEntity", back_populates="aliases")
+
+    __table_args__ = (
+        UniqueConstraint("entity_id", "normalized", name="uq_entity_alias_per_node"),
+    )
+
+
+class GraphEdge(Base):
+    """
+    Unique typed relation between two canonical entities.
+
+    Identity is the triple (source, target, relation): every chunk repeating
+    the same statement produces an EdgeMention row, not a new edge. Raw
+    predicate wording ("to validate tokens") goes to `description` and does
+    not participate in deduplication.
+    """
+    __tablename__ = "graph_edges"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("graph_entities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    target_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("graph_entities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relation: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    mentions: Mapped[list["EdgeMention"]] = relationship(
+        "EdgeMention", back_populates="edge", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source_id", "target_id", "relation", name="uq_graph_edge_triple"),
+        CheckConstraint("source_id <> target_id", name="ck_graph_edge_no_self_loop"),
+    )
+
+
+class EdgeMention(Base):
+    """
+    Proof that one chunk asserts one edge. The composite PK (edge_id, chunk_id)
+    physically forbids the same chunk claiming the same fact twice — the
+    deduplication is the constraint, not application code.
+    """
+    __tablename__ = "edge_mentions"
+
+    edge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("graph_edges.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("service_documentation_chunks.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    edge: Mapped["GraphEdge"] = relationship("GraphEdge", back_populates="mentions")
+    chunk: Mapped["ServiceDocumentationChunk"] = relationship("ServiceDocumentationChunk")

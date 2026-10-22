@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # Backend API URL for Streamlit frontend
     BACKEND_API_URL: str = "http://localhost:8000"
 
+    # Neo4j graph store (bolt protocol)
+    NEO4J_URI: str = "bolt://localhost:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "graphrag123"
+
 
 @lru_cache
 def get_settings() -> Settings:

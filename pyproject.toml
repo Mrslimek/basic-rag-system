@@ -16,6 +16,7 @@ dependencies = [
     "fastembed>=0.9.0",
     "langchain-openai>=1.7.2",
     "httpx2>=2.16.0",
+    "neo4j>=6.4.1",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,12 @@ packages = ["app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Share one event loop across all async tests. The module-level asyncpg engine
+# pools connections bound to the loop they were created on; function-scoped
+# loops would leave test 2 with stale connections from test 1's closed loop
+# ("attached to a different loop" / "Event loop is closed").
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests"]
 
 [tool.uv.workspace]
