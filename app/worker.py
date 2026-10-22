@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 from taskiq import InMemoryBroker, TaskiqScheduler
 from taskiq.schedule_sources import LabelScheduleSource
 
+from app.graph_extractor import GraphExtractor
 from app.chunker import chunk_markdown_paragraphs
 from app.config import get_settings
 from app.database import get_db_context, init_db
@@ -37,7 +38,7 @@ async def sync_document_file(file_path: Path) -> bool:
     """
     Parses a single markdown document, compares hash with database,
     and updates documentation chunks & embeddings if modified.
-    
+
     Returns:
         True if updated or inserted, False if skipped because unchanged.
     """
@@ -91,12 +92,17 @@ async def sync_document_file(file_path: Path) -> bool:
             await session.flush()  # populate service_record.id
 
         # 4. Insert new chunks with vector embeddings
+        extractor = GraphExtractor()
         for chunk_data, emb in zip(chunks, embeddings):
+            extraction = await extractor.extract(chunk_data.content)
+
             chunk_row = ServiceDocumentationChunk(
                 service_id=service_record.id,
                 chunk_index=chunk_data.index,
                 content=chunk_data.content,
                 embedding=emb,
+                entities=extraction["entities"],
+                relations=extraction["relations"],
             )
             session.add(chunk_row)
 

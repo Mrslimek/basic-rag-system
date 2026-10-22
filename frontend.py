@@ -1,5 +1,5 @@
 from typing import Any
-import httpx
+import httpx2 as httpx
 import streamlit as st
 from app.config import get_settings
 

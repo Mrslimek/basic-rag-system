@@ -8,7 +8,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from app.config import get_settings
@@ -68,11 +68,13 @@ class ServiceDocumentationChunk(Base):
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    
+
     # 384 dimensions for multilingual-e5-small
     embedding: Mapped[list[float]] = mapped_column(
         Vector(settings.EMBEDDING_DIMENSION), nullable=False
     )
+    entities: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    relations: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

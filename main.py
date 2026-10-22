@@ -1,6 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
-import httpx
+import httpx2 as httpx
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,4 +148,3 @@ async def chat_endpoint(
     ]
 
     return ChatResponse(reply=llm_reply, sources=sources)
-

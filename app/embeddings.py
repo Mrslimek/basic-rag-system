@@ -51,7 +51,7 @@ class EmbeddingService:
         if self._model is None:
             self._model = TextEmbedding(
                 self.model_name,
-                local_files_only=True,
+                local_files_only=False,
             )
         return self._model
 

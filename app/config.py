@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Uses installed local Ollama models (e.g. qwen2.5-coder:7b or qwen2.5-coder:3b)
     LLM_API_BASE: str = "http://127.0.0.1:8080/v1"
     LLM_API_KEY: str = "ollama"
-    LLM_MODEL: str = "qwen2.5-coder-7b"
+    LLM_MODEL: str = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
 
     # Backend API URL for Streamlit frontend
     BACKEND_API_URL: str = "http://localhost:8000"
