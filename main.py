@@ -1,12 +1,13 @@
 import logging
 from contextlib import asynccontextmanager
-import httpx2 as httpx
 from fastapi import Depends, FastAPI, HTTPException
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db_session, init_db
+from app.llm import get_chat_model
 from app.rag_service import rag_service
 
 logging.basicConfig(level=logging.INFO)
@@ -72,29 +73,15 @@ async def query_llm(prompt: str, context: str) -> str:
 
     full_user_message = f"Documentation Context:\n{context}\n\nQuestion:\n{prompt}"
 
-    payload = {
-        "model": settings.LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": full_user_message},
-        ],
-        "temperature": 0.2,
-    }
-
+    llm = get_chat_model(temperature=0.2)
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{settings.LLM_API_BASE.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"},
-                json=payload,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            else:
-                logger.warning(
-                    f"LLM endpoint returned status {resp.status_code}: {resp.text}"
-                )
+        response = await llm.ainvoke(
+            [
+                SystemMessage(content=system_instruction),
+                HumanMessage(content=full_user_message),
+            ]
+        )
+        return response.text
     except Exception as exc:
         logger.info(f"Local LLM not reachable at {settings.LLM_API_BASE} ({exc}). Using direct context synthesis.")
 

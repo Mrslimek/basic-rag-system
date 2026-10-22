@@ -14,6 +14,7 @@ dependencies = [
     "taskiq>=0.11.0",
     "streamlit>=1.40.0",
     "fastembed>=0.9.0",
+    "langchain-openai>=1.7.2",
     "httpx2>=2.16.0",
 ]
 
