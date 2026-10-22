@@ -1,6 +1,8 @@
 services:
   db:
-    image: pgvector/pgvector:pg18
+    # Plain PostgreSQL 18: vectors now live in Qdrant, Postgres keeps documents + graph JSONB.
+    # (Previously pgvector/pgvector:pg18 — the extension is dropped by app/backfill_qdrant.py.)
+    image: postgres:18-alpine
     container_name: rag_docs_db
     restart: unless-stopped
     environment:
@@ -17,6 +19,16 @@ services:
       timeout: 5s
       retries: 5
 
+  qdrant:
+    image: qdrant/qdrant:v1.20.0  # matches qdrant-client 1.20 in pyproject
+    container_name: rag_docs_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333" # REST API + built-in web dashboard: http://localhost:6333/dashboard
+      - "6334:6334" # gRPC API
+    volumes:
+      - qdrantdata:/qdrant/storage
+
   neo4j:
     image: neo4j:5.26
     container_name: rag_docs_neo4j
@@ -32,4 +44,5 @@ services:
 
 volumes:
   pgdata:
+  qdrantdata:
   neo4jdata:

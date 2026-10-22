@@ -59,12 +59,10 @@ async def test_edge_triple_dedup_and_mention_accumulation():
         chunk_a = ServiceDocumentationChunk(
             service_id=service.id, chunk_index=0,
             content="Billing calls Auth Service to validate tokens.",
-            embedding=[0.0] * 384,
         )
         chunk_b = ServiceDocumentationChunk(
             service_id=service.id, chunk_index=1,
             content="Billing calls Auth Service to validate tokens. (repeated)",
-            embedding=[0.0] * 384,
         )
         billing = GraphEntity(canonical_name=f"billing-{suffix}", entity_type="service")
         auth = GraphEntity(canonical_name=f"auth-{suffix}", entity_type="service")

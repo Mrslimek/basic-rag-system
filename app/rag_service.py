@@ -3,6 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.embeddings import embedding_service, EmbeddingService
 from app.models import Service, ServiceDocumentationChunk
+from app.vectorstore import get_vectorstore
 
 
 @dataclass(frozen=True)
@@ -17,10 +18,11 @@ class SearchResult:
 
 class RAGService:
     """
-    Core RAG retrieval engine:
+    Core RAG retrieval engine (two-store architecture):
     1. Generates query embeddings with 'query: ' prefix and unit normalization.
-    2. Performs vector dot-product similarity search against `service_documentation_chunks`.
-    3. Joins `services` table to fetch microservice provenance metadata.
+    2. ANN search in Qdrant: returns chunk UUIDs + cosine scores (+ payload filter
+       by service_name instead of a SQL JOIN WHERE).
+    3. Joins back to Postgres by id to fetch authoritative text & provenance.
     4. Formats context with clear provenance boundaries for the downstream LLM.
     """
 
@@ -35,48 +37,48 @@ class RAGService:
         service_filter: str | None = None,
     ) -> list[SearchResult]:
         """
-        Executes vector similarity search using inner product / max_inner_product.
-        
-        Because vectors are normalized to L2 norm = 1:
-        dot_product(u, v) == cosine_similarity(u, v) ∈ [-1, 1].
-        
-        In pgvector, `max_inner_product(embedding, query_vector)` computes negative inner product
-        `<#>` for order by ascending. To return a human-readable similarity score between -1 and 1,
-        we compute: score = -1 * (embedding.max_inner_product(query_vector)).
+        Vector recall happens in Qdrant, not in Postgres anymore.
+
+        Because e5-small vectors are L2-normalized, Qdrant's COSINE score equals
+        the old pgvector inner-product score: similarity ∈ [-1..1], higher = better.
+
+        Qdrant is the ANN index (approximate, fast); Postgres stays the source of
+        truth for chunk text — we only trust rows that still exist there, so stale
+        points (e.g. from an interrupted re-sync) silently drop out.
         """
         query_vector = await self.embeddings.embed_query(query)
+        hits = await get_vectorstore().search(
+            vector=query_vector, top_k=top_k, service_filter=service_filter
+        )
+        if not hits:
+            return []
 
-        # Build distance expression using pgvector's max_inner_product (<#> operator)
-        distance_expr = ServiceDocumentationChunk.embedding.max_inner_product(query_vector)
-
+        # Second stage: hydrate ids -> rows with provenance. `search_vector`
+        # keeps the Qdrant ranking; the SQL IN-list lookup is by primary key.
+        chunk_ids = [h.chunk_id for h in hits]
         stmt = (
             select(
+                ServiceDocumentationChunk.id,
                 Service.name.label("service_name"),
                 Service.doc_file_path.label("doc_file_path"),
                 ServiceDocumentationChunk.chunk_index.label("chunk_index"),
                 ServiceDocumentationChunk.content.label("content"),
-                (-1 * distance_expr).label("similarity_score"),
             )
             .join(Service, Service.id == ServiceDocumentationChunk.service_id)
-            .order_by(distance_expr.asc())
-            .limit(top_k)
+            .where(ServiceDocumentationChunk.id.in_(chunk_ids))
         )
-
-        if service_filter:
-            stmt = stmt.where(Service.name == service_filter)
-
-        result = await session.execute(stmt)
-        rows = result.all()
+        rows = {row.id: row for row in (await session.execute(stmt)).all()}
 
         return [
             SearchResult(
-                service_name=row.service_name,
-                doc_file_path=row.doc_file_path,
-                chunk_index=row.chunk_index,
-                content=row.content,
-                similarity_score=float(row.similarity_score),
+                service_name=rows[h.chunk_id].service_name,
+                doc_file_path=rows[h.chunk_id].doc_file_path,
+                chunk_index=rows[h.chunk_id].chunk_index,
+                content=rows[h.chunk_id].content,
+                similarity_score=h.score,
             )
-            for row in rows
+            for h in hits
+            if h.chunk_id in rows
         ]
 
     def build_context(self, search_results: list[SearchResult]) -> str:

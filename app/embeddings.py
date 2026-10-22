@@ -16,7 +16,8 @@ class EmbeddingService:
        - Passages: "passage: "
        - Queries: "query: "
        This aligns vectors in the contrastive embedding subspace learned by the E5 model family.
-    3. Output vectors are unit-normalized (L2 norm = 1.0) for dot-product similarity (<#> in pgvector).
+    3. Output vectors are unit-normalized (L2 norm = 1.0): cosine == dot product,
+       which is what Qdrant's COSINE distance scores against (see app/vectorstore.py).
     4. Model inference runs in a thread pool via `asyncio.to_thread` to keep the FastAPI event loop unblocked.
     """
 

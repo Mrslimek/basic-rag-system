@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.database import get_db_context, init_db
 from app.embeddings import embedding_service
 from app.models import Service, ServiceDocumentationChunk
+from app.vectorstore import ChunkVector, get_vectorstore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docs_sync_worker")
@@ -80,6 +81,10 @@ async def sync_document_file(file_path: Path) -> bool:
                     ServiceDocumentationChunk.service_id == service_record.id
                 )
             )
+            # ...and their vectors: the re-synced chunks get NEW uuids, so without
+            # this delete the old Qdrant points would linger as orphan rows of the
+            # vector index (points whose Postgres row no longer exists).
+            await get_vectorstore().delete_by_service(str(service_record.id))
         else:
             service_record = Service(
                 name=service_name,
@@ -91,8 +96,10 @@ async def sync_document_file(file_path: Path) -> bool:
             session.add(service_record)
             await session.flush()  # populate service_record.id
 
-        # 4. Insert new chunks with vector embeddings
+        # 4. Insert chunk rows (text + graph JSONB in Postgres), then push their
+        # vectors to Qdrant under the same uuid ids (upsert = idempotent by id).
         extractor = GraphExtractor()
+        chunk_rows: list[ServiceDocumentationChunk] = []
         for chunk_data, emb in zip(chunks, embeddings):
             extraction = await extractor.extract(chunk_data.content)
 
@@ -100,11 +107,25 @@ async def sync_document_file(file_path: Path) -> bool:
                 service_id=service_record.id,
                 chunk_index=chunk_data.index,
                 content=chunk_data.content,
-                embedding=emb,
                 entities=extraction["entities"],
                 relations=extraction["relations"],
             )
             session.add(chunk_row)
+            chunk_rows.append(chunk_row)
+
+        await session.flush()  # populate chunk_row.id (python-side uuid4 defaults)
+
+        await get_vectorstore().upsert_chunks([
+            ChunkVector(
+                chunk_id=row.id,
+                service_id=str(service_record.id),
+                service_name=service_name,
+                doc_file_path=str(file_path),
+                chunk_index=row.chunk_index,
+                embedding=emb,
+            )
+            for row, emb in zip(chunk_rows, embeddings)
+        ])
 
         await session.commit()
         logger.info(
@@ -147,8 +168,9 @@ async def sync_docs_task() -> dict[str, int]:
 
 async def run_worker() -> None:
     """Entrypoint for running the worker and scheduler together."""
-    logger.info("Initializing database schemas and pgvector extension...")
+    logger.info("Initializing database schemas and Qdrant collection...")
     await init_db()
+    await get_vectorstore().ensure_collection()
     logger.info("Running initial documentation sync immediately on startup...")
     await sync_docs_task()
 

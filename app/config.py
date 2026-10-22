@@ -14,9 +14,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database Configuration (PostgreSQL with pgvector)
+    # Database Configuration (PostgreSQL: documents + graph extraction JSONB, no more vectors)
     # Using asyncpg driver for asynchronous database I/O
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/rag_docs_db"
+
+    # Qdrant vector store (replaces the pgvector column)
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_COLLECTION: str = "doc_chunks"
     
     # Embedding Model Configuration
     # intfloat/multilingual-e5-small produces 384-dimensional dense vectors

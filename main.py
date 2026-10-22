@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.database import get_db_session, init_db
 from app.llm import get_chat_model
 from app.rag_service import rag_service
+from app.vectorstore import get_vectorstore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rag_api")
@@ -18,14 +19,23 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup & shutdown events."""
-    logger.info("Verifying database schema on FastAPI startup...")
+    logger.info("Verifying database schema and Qdrant collection on FastAPI startup...")
     try:
         await init_db()
-        logger.info("Database schemas and pgvector initialized successfully.")
+        logger.info("Database schemas initialized successfully.")
     except Exception as e:
         logger.warning(
             f"Could not connect to PostgreSQL on startup ({e}). "
-            "Ensure PostgreSQL with pgvector is running before invoking RAG queries."
+            "Ensure PostgreSQL is running before invoking RAG queries."
+        )
+    try:
+        store = get_vectorstore()
+        await store.ensure_collection()
+        logger.info("Qdrant collection is ready.")
+    except Exception as e:
+        logger.warning(
+            f"Could not reach Qdrant on startup ({e}). "
+            "Run `docker compose up -d qdrant` before invoking RAG queries."
         )
     yield
 
@@ -33,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Microservices Documentation RAG Assistant",
     version="0.1.0",
-    description="Vector search and RAG assistant over microservice markdown specifications using pgvector and e5-small.",
+    description="Vector search and RAG assistant over microservice markdown specifications using Qdrant (vectors), Neo4j (graph) and e5-small embeddings.",
     lifespan=lifespan,
 )
 
@@ -105,7 +115,7 @@ async def chat_endpoint(
     """
     Primary RAG endpoint:
     1. Embeds user query with 'query: ' prefix and unit normalization.
-    2. Performs inner-product similarity search against pgvector.
+    2. Performs cosine ANN search in Qdrant, hydrates hits from Postgres.
     3. Formats provenance context with microservice metadata.
     4. Calls LLM (or fallback) and returns structured response.
     """

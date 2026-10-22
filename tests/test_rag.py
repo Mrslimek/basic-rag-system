@@ -19,12 +19,10 @@ def test_models_structure():
         service_id=service_id,
         chunk_index=0,
         content="This is sample endpoint documentation.",
-        embedding=[0.0] * 384,
     )
 
     assert service.name == "test_service"
     assert chunk.chunk_index == 0
-    assert len(chunk.embedding) == 384
     assert ServiceDocumentationChunk.__tablename__ == "service_documentation_chunks"
     assert Service.__tablename__ == "services"
 

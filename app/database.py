@@ -1,6 +1,5 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -11,10 +10,8 @@ from app.config import get_settings
 
 settings = get_settings()
 
-# Engine creation:
-# pgvector.sqlalchemy.Vector automatically handles string/list serialization for queries and distance operators.
-# We do NOT register asyncpg binary codecs because SQLAlchemy's Vector type serializer already prepares values as strings,
-# which would conflict with asyncpg's binary codec expecting raw list/ndarray.
+# Engine creation: Postgres owns documents/chunks/graph tables only.
+# Vectors live in Qdrant (app/vectorstore.py), so no pgvector codecs are registered here.
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
@@ -62,17 +59,14 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
 async def init_db(target_engine: AsyncEngine | None = None) -> None:
     """
     Bootstrap database:
-    1. Ensures pgvector extension is installed (`CREATE EXTENSION IF NOT EXISTS vector`).
-    2. Registers the pgvector asyncpg codec for direct vector type handling.
-    3. Creates all tables defined in models.py if they do not exist.
+    1. Creates all tables defined in models.py if they do not exist.
+    Vectors are NOT stored here anymore (Qdrant owns them, see app/vectorstore.py),
+    so the pgvector extension is no longer required.
     """
     from app.models import Base
 
     active_engine = target_engine or engine
 
     async with active_engine.begin() as conn:
-        # Enable pgvector extension before creating tables with Vector columns
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-
-        # Create all tables (services, service_documentation_chunks, and HNSW indexes)
+        # Create all tables (services, chunks, graph layer; HNSW index is gone)
         await conn.run_sync(Base.metadata.create_all)

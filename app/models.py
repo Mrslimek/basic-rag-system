@@ -3,17 +3,12 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     DateTime,
     ForeignKey,
-    Index,
     Integer,
     String,
     Text, UniqueConstraint, CheckConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from pgvector.sqlalchemy import Vector
-from app.config import get_settings
-
-settings = get_settings()
 
 
 class Base(DeclarativeBase):
@@ -52,8 +47,9 @@ class Service(Base):
 class ServiceDocumentationChunk(Base):
     """
     Represents a discrete semantic chunk of a microservice's documentation.
-    Embeddings are 384-dimensional unit vectors (via intfloat/multilingual-e5-small).
-    Indexed using HNSW with vector_ip_ops (inner product) for ultra-fast normalized vector search.
+    This row is the source of truth for chunk TEXT and graph extraction results;
+    the embedding lives in Qdrant as a point with the SAME uuid id
+    (see app/vectorstore.py).
     """
     __tablename__ = "service_documentation_chunks"
 
@@ -69,10 +65,6 @@ class ServiceDocumentationChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
-    # 384 dimensions for multilingual-e5-small
-    embedding: Mapped[list[float]] = mapped_column(
-        Vector(settings.EMBEDDING_DIMENSION), nullable=False
-    )
     entities: Mapped[dict] = mapped_column(JSONB, nullable=True)
     relations: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
@@ -84,20 +76,6 @@ class ServiceDocumentationChunk(Base):
 
     # Relationship back to service parent entity for provenance tracking
     service: Mapped["Service"] = relationship("Service", back_populates="chunks")
-
-    __table_args__ = (
-        # HNSW Index for vector search:
-        # We use inner product ('vector_ip_ops' / max_inner_product) because multilingual-e5-small
-        # embeddings are normalized to unit length (||v|| = 1). For unit vectors, inner product
-        # is mathematically identical to cosine similarity but runs significantly faster.
-        Index(
-            "ix_doc_chunks_embedding_hnsw",
-            embedding,
-            postgresql_using="hnsw",
-            postgresql_with={"m": 16, "ef_construction": 64},
-            postgresql_ops={"embedding": "vector_ip_ops"},
-        ),
-    )
 
 
 # --- Graph layer: canonical nodes, deduplicated edges, per-chunk evidence ---
