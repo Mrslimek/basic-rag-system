@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # Qdrant vector store (replaces the pgvector column)
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION: str = "doc_chunks"
+
+    # LlamaIndex pipeline uses its own collection on the same Qdrant server
+    LLAMA_QDRANT_COLLECTION: str = "llama_doc_chunks"
     
     # Embedding Model Configuration
     # intfloat/multilingual-e5-small produces 384-dimensional dense vectors

@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 from fastapi import Depends, FastAPI, HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -10,6 +11,7 @@ from app.database import get_db_session, init_db
 from app.llm import get_chat_model
 from app.rag_service import rag_service
 from app.vectorstore import get_vectorstore
+from app import llama_rag
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rag_api")
@@ -54,6 +56,10 @@ class ChatRequest(BaseModel):
         None, description="Optional microservice name to narrow vector search (e.g., 'billing')"
     )
     top_k: int = Field(default=3, ge=1, le=10, description="Number of context passages to retrieve")
+    mode: Literal["handwritten", "llamaindex"] = Field(
+        default="handwritten",
+        description="Retrieval pipeline: hand-written Qdrant+SQL path, or the LlamaIndex framework path",
+    )
 
 
 class SourceReference(BaseModel):
@@ -113,25 +119,36 @@ async def chat_endpoint(
     session: AsyncSession = Depends(get_db_session),
 ):
     """
-    Primary RAG endpoint:
-    1. Embeds user query with 'query: ' prefix and unit normalization.
-    2. Performs cosine ANN search in Qdrant, hydrates hits from Postgres.
-    3. Formats provenance context with microservice metadata.
-    4. Calls LLM (or fallback) and returns structured response.
+    Primary RAG endpoint. Two interchangeable pipelines behind `mode`:
+      handwritten — our own Qdrant ANN + Postgres hydration (baseline, A/B reference)
+      llamaindex  — the framework path: IngestionPipeline-built collection,
+                    RetrieverQueryEngine synthesis, same embeddings & LLM.
+    Both return the same reply/sources shape for direct comparison.
     """
-    try:
-        results = await rag_service.retrieve_chunks(
-            session=session,
-            query=request.message,
-            top_k=request.top_k,
-            service_filter=request.service_filter,
-        )
-    except Exception as e:
-        logger.error(f"Error during RAG retrieval: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Database retrieval error: {str(e)}")
+    if request.mode == "llamaindex":
+        try:
+            llm_reply, results = await llama_rag.aquery(
+                question=request.message,
+                top_k=request.top_k,
+                service_filter=request.service_filter,
+            )
+        except Exception as e:
+            logger.error(f"Error during LlamaIndex query: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"LlamaIndex retrieval error: {str(e)}")
+    else:
+        try:
+            results = await rag_service.retrieve_chunks(
+                session=session,
+                query=request.message,
+                top_k=request.top_k,
+                service_filter=request.service_filter,
+            )
+        except Exception as e:
+            logger.error(f"Error during RAG retrieval: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Database retrieval error: {str(e)}")
 
-    context_str = rag_service.build_context(results)
-    llm_reply = await query_llm(prompt=request.message, context=context_str)
+        context_str = rag_service.build_context(results)
+        llm_reply = await query_llm(prompt=request.message, context=context_str)
 
     sources = [
         SourceReference(
