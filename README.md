@@ -61,7 +61,7 @@ Streamlit sidebar (vector | graph) → POST /chat { retrieve_mode } → LlamaInd
 - **Python 3.14** (configured via `.python-version`)
 - **[uv](https://docs.astral.sh/uv/)** package manager
 - **Docker** (for PostgreSQL, Qdrant, and Neo4j via docker-compose)
-- *(Optional)* **Ollama** running locally with `llama3.2` or any OpenAI-compatible API (`http://localhost:11434/v1`). Graph sync and answer synthesis both call the LLM, so one must be reachable for those steps.
+- *(Optional)* **llama.cpp** running locally serving `Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF` at `http://127.0.0.1:8080/v1` (API key `ollama`), or any OpenAI-compatible API. Graph sync and answer synthesis both call the LLM, so one must be reachable for those steps.
 
 ---
 
@@ -75,9 +75,9 @@ NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=graphrag123
 EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small
-LLM_API_BASE=http://localhost:11434/v1
+LLM_API_BASE=http://127.0.0.1:8080/v1
 LLM_API_KEY=ollama
-LLM_MODEL=llama3.2
+LLM_MODEL=Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF
 BACKEND_API_URL=http://localhost:8000
 ```
 
