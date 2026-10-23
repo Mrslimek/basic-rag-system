@@ -1071,6 +1071,19 @@ wheels = [
 ]
 
 [[package]]
+name = "llama-index-graph-stores-neo4j"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llama-index-core" },
+    { name = "neo4j" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6e/be/9c3a82e05277e2e53977af975be4b5da256d3925e092cc928432ecbc3400/llama_index_graph_stores_neo4j-0.8.0.tar.gz", hash = "sha256:4046b32ffd09fe6cc9c385ef1193aa9ba41aba369dc358abb835b5a3a3e1e7c0", size = 17380, upload-time = "2026-08-31T15:54:08.754Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/bf/65762164a0b9b06627145b22fa5ba5eb9bfd2598ff2d3b33eff6d0dbf3c6/llama_index_graph_stores_neo4j-0.8.0-py3-none-any.whl", hash = "sha256:367aaab7296f684f5354e22bc837307293b7581b23f83fb3abc8ef9ed8681ab2", size = 18589, upload-time = "2026-08-31T15:54:07.959Z" },
+]
+
+[[package]]
 name = "llama-index-instrumentation"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1445,14 +1458,14 @@ wheels = [
 
 [[package]]
 name = "neo4j"
-version = "6.4.1"
+version = "5.28.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pytz" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d1/d1/bc40a291c60b06738ce92d5f0259d348eee1f07ba10d569a881c848c8afe/neo4j-6.4.1.tar.gz", hash = "sha256:fac99b7cb9679b93ef97dc23f22a3f0e7c3feb2db223eddfd2521f27005cfeaf", size = 287897, upload-time = "2026-10-15T10:47:26.666Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/e2/62b2ced8591abf5aabb4bce6160dacb75e53992875ee6aec03fb5ea2dc0d/neo4j-5.28.8.tar.gz", hash = "sha256:b2531e5fb618bd1b0f5f3d62b5f9be480a66969396f82c41caaf2f3539f7e72c", size = 234107, upload-time = "2026-10-15T11:02:32.284Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/69/3036bdcacfba561c6ef4b00fe72529e0a1b6241a6b2de82572a0940a276b/neo4j-6.4.1-py3-none-any.whl", hash = "sha256:f56a281c74355522fc2642df8919bec450115431531b8f3f6fe1cc17acb57a27", size = 390684, upload-time = "2026-10-15T10:47:25.236Z" },
+    { url = "https://files.pythonhosted.org/packages/34/5b/c3a3fc2604cd578c27f8d36de7973093ebc7c148f749be9db067dd63a00a/neo4j-5.28.8-py3-none-any.whl", hash = "sha256:f8ecdad94be88f0f7a766a284a9a7023db9e7bd92d1b0a4fe6d6e191feb97f91", size = 314703, upload-time = "2026-10-15T11:02:29.605Z" },
 ]
 
 [[package]]
@@ -2123,6 +2136,7 @@ dependencies = [
     { name = "httpx2" },
     { name = "llama-index-core" },
     { name = "llama-index-embeddings-fastembed" },
+    { name = "llama-index-graph-stores-neo4j" },
     { name = "llama-index-llms-openai-like" },
     { name = "llama-index-vector-stores-qdrant" },
     { name = "neo4j" },
@@ -2148,9 +2162,10 @@ requires-dist = [
     { name = "httpx2", specifier = ">=2.16.0" },
     { name = "llama-index-core", specifier = ">=0.14.25" },
     { name = "llama-index-embeddings-fastembed", specifier = ">=0.7.0" },
+    { name = "llama-index-graph-stores-neo4j", specifier = ">=0.8.0" },
     { name = "llama-index-llms-openai-like", specifier = ">=0.8.1" },
     { name = "llama-index-vector-stores-qdrant", specifier = ">=0.10.4" },
-    { name = "neo4j", specifier = ">=6.4.1" },
+    { name = "neo4j", specifier = ">=5.16,<6" },
     { name = "pydantic-settings", specifier = ">=2.5.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },

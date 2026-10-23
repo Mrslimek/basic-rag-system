@@ -35,6 +35,8 @@ services:
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-graphrag123}
       NEO4J_server_memory_heap_max__size: 1G
+      # llama-index Neo4jPropertyGraphStore requires APOC (merge.relationship, create.addLabels, meta.data)
+      NEO4J_PLUGINS: '["apoc"]'
     ports:
       - "7474:7474" # Browser UI: http://localhost:7474
       - "7687:7687" # Bolt protocol used by the python driver

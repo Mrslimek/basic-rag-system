@@ -2,8 +2,14 @@
 THE RAG pipeline — LlamaIndex is the single retrieval interface.
 
 There is exactly one pipeline here: the hand-written retriever and any
-parallel A/B pipeline have been removed; a future A/B comparison will be
-vector-vs-graph retrieval *inside* this module, not competing stacks.
+parallel A/B pipeline have been removed. Two retrieval branches live inside
+this single LlamaIndex flow, selected by `retrieve_mode`:
+  vector = the Qdrant collection (default);
+  graph  = PropertyGraphIndex over Neo4j (retriever built by app/graph_rag.py,
+           imported lazily so this module never needs Neo4j at import time).
+Both branches return chunk TextNodes with the same provenance metadata and
+share one synthesis path (same LLM, same SearchResult currency), so a
+vector-vs-graph A/B never leaves this module.
 
   Postgres   = source of truth for chunk text (unchanged, worker-owned).
   Qdrant     = ONE collection (default `doc_chunks`). QdrantVectorStore writes
@@ -24,11 +30,13 @@ import asyncio
 import logging
 import sys
 from dataclasses import dataclass
+from typing import Literal
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.llms import LLM
+from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, MetadataInfo, VectorStoreInfo
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -101,7 +109,7 @@ def get_async_client() -> AsyncQdrantClient:
     """Async client for point ops — llama_rag owns its Qdrant connections."""
     global _async_client
     if _async_client is None:
-        _async_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30.0)
+        _async_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30)
     return _async_client
 
 
@@ -214,8 +222,25 @@ def build_query_engine(
     top_k: int = 4,
     service_filter: str | None = None,
     collection_name: str | None = None,
+    retrieve_mode: Literal["vector", "graph"] = "vector",
 ):
-    """RetrieverQueryEngine: compact synthesis puts several small chunks into one prompt."""
+    """RetrieverQueryEngine: compact synthesis puts several small chunks into one prompt.
+
+    vector: Qdrant-backed index (service_filter and collection_name apply).
+    graph:  PropertyGraphIndex retriever from app/graph_rag.py; service_filter is
+    ignored (no per-service filter in this MVP) and the default text-QA prompt
+    is kept.
+    """
+    if retrieve_mode == "graph":
+        # Imported here, not at module top: graph retrieval needs Neo4j, the
+        # vector path must not.
+        from app import graph_rag
+
+        return RetrieverQueryEngine.from_args(
+            retriever=graph_rag.build_graph_retriever(top_k=top_k),
+            llm=build_llm(),
+            response_mode="compact",
+        )
     index = build_index(collection_name)
     filters = (
         MetadataFilters(filters=[MetadataFilter(key=FILTER_SERVICE_KEY, value=service_filter)])
@@ -250,14 +275,22 @@ async def aquery(
     top_k: int = 4,
     service_filter: str | None = None,
     collection_name: str | None = None,
+    retrieve_mode: Literal["vector", "graph"] = "vector",
 ) -> tuple[str, list[SearchResult]]:
     """
     Library-first query: retriever + ResponseSynthesizer + shared LLM client, all LlamaIndex.
 
+    retrieve_mode selects the retrieval branch: "vector" (Qdrant) or "graph"
+    (PropertyGraphIndex/Neo4j); synthesis and this fallback are shared.
     When the local LLM is offline, retrieval still answers: the citation-formatted
     raw context is returned instead.
     """
-    engine = build_query_engine(top_k=top_k, service_filter=service_filter, collection_name=collection_name)
+    engine = build_query_engine(
+        top_k=top_k,
+        service_filter=service_filter,
+        collection_name=collection_name,
+        retrieve_mode=retrieve_mode,
+    )
     try:
         response = await engine.aquery(question)
         sources = _nodes_to_results(list(response.source_nodes))

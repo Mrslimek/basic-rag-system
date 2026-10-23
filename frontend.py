@@ -24,6 +24,13 @@ with st.sidebar:
         index=0,
     )
     top_k = st.slider("Passages to retrieve (top_k)", min_value=1, max_value=10, value=3)
+    rag_mode = st.radio(
+        "RAG mode",
+        options=["vector", "graph"],
+        index=0,
+        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval via LlamaIndex PropertyGraphIndex (Neo4j)",
+    )
+    st.caption("vector finds passages by embedding similarity; graph follows relationships in the knowledge graph.")
 
 # Initialize chat history in Streamlit session state
 if "messages" not in st.session_state:
@@ -64,6 +71,7 @@ if prompt := st.chat_input("Ask a question about your microservices..."):
     payload: dict[str, Any] = {
         "message": prompt,
         "top_k": top_k,
+        "retrieve_mode": rag_mode,
     }
     if selected_service != "All Services":
         payload["service_filter"] = selected_service

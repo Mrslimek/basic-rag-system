@@ -1,42 +1,37 @@
-## LlamaIndex поверх существующей инфраструктуры (режим A/B)
+## GraphRAG через LlamaIndex (PropertyGraphIndex + Neo4j) — финальный план
 
-**Идея:** не выбрасываем рукописный путь — он остаётся базовой линией сравнения и материалом для обучения. LlamaIndex добавляется как вторая реализация того же пайплайна поверх той же инфраструктуры (Postgres = источник правды, тот же сервер Qdrant, те же e5-векторы fastembed, тот же llama.cpp-LLM). На собесе это сильный рассказ: «умею и руками, и фреймворком; понимаю, что именно фреймворк делает под капотом».
+### Принцип (записан в память)
+Что умеет LlamaIndex нативно — делает LlamaIndex. Самописный графовый стек (`graph_extractor.py`, `graph_neo4j.py`) удаляем, когда нативная ветка заработает.
 
-### Архитектурные решения (и почему)
+### Что уже проверено (read-only разведка агента, core 0.14.25)
+- `IngestionPipeline` граф-стор НЕ принимает — graph пишет `PropertyGraphIndex.insert_nodes/ainsert` (всего лишь upsert по id чанка; удаление по чанкам — `store.delete_llama_nodes(node_ids=[chunk uuid])`).
+- `retriever_mode=`-строк нет: ретривер собирается явно — `index.as_retriever(sub_retrievers=[...])`. Доступные суб-ретриверы: `LLMSynonymRetriever` (скор всегда 1.0) и `VectorContextRetriever` (настоящий cosine). Возвращают обычные `NodeWithScore`.
+- `SchemaLLMPathExtractor` дёргает `astructured_predict` → json_schema (тот же путь, что уже работает на llama.cpp) + есть `ImplicitPathExtractor` (без LLM) и текстовый `SimpleLLMPathExtractor` как fallback.
+- OpenAILike + `should_use_structured_outputs=True` уже подходит под это без изменений.
 
-1. **Worker и Postgres-чанковка остаются владельцами данных.** LlamaIndex не пересоздаёт чанки (у его нод были бы другие id/границы) — синхронизация читает готовые чанки из Postgres и строит `TextNode` с `id_ = str(chunk.id)`, чтобы UUID связывал оба хранилища (тот же FK-трюк, что уже в `app/vectorstore.py`). В проде так и делают: БД — system of record, индекс — производное.
-2. **Отдельная коллекция Qdrant `llama_doc_chunks`.** У `QdrantVectorStore` свой payload-схема (`text` + `metadata.*`); смешивать двух писателей в одной коллекции — каша. Две коллекции — честная картина «параллельные индексы при миграции/сравнении».
-3. **Общая точка входа — embeddinг-адаптер.** Пишем свой `BaseEmbedding`-класс (`E5FastEmbed`), который внутри вызывает существующий `embedding_service` (асинхронные `_aget_*` — батчи через `embed_passages`). Это гарантирует *идентичные векторы* с рукописным путём → скоринги в A/B сравнимы, и это же типовой продакшен-паттерн «свой провайдер внутрь чужого фреймворка».
-4. **Полный library-first запрос:** `RetrieverQueryEngine` (retriever + ResponseSynthesizer с нашей системной инструкцией «отвечай только по контексту, ссылайся на сервис», fallback как сейчас) — LlamaIndex используется целиком, а не только как обёртка поиска. Провенанс берём из `response.source_nodes`.
+### Волна 0-исполнение (агент)
+1. `uv add llama-index-graph-stores-neo4j` + `uv pip check`.
+2. Читать УСТАНОВЛЕННЫЙ wheel: точная сигнатура `Neo4jPropertyGraphStore` (две конфликтующие версии в природе), labels/rel-типы, требует ли APOC; проверить APOC на живом контейнере и флаг, который его обходит.
+3. Живой round-trip проба с именами `zzwave0_test_*` (upsert → get → delete, полная cleanup), существующий Entity/Alias/REL-граф не трогать.
+4. Реальный один вызов `SchemaLLMPathExtractor` против нашего llama.cpp 1.5B; при провале — `allow_additional_properties=False`, затем fallback `SimpleLLMPathExtractor`. Результат фиксируется контрактом для волны 1.
+Только pyproject/uv.lock + /tmp-скрипты; файлов фич не создаёт.
 
-### Файлы
+### Волна 1 — параллельные агенты
+- **G1 `app/graph_rag.py` (новый)**: стор (lru_cache), `PropertyGraphIndex.from_existing(store, llm=get_chat_model(), kg_extractors=[SchemaLLMPathExtractor(cхema микросервисов: Service/Endpoint/Database/Queue/Concept; calls/authenticates_via/stores_in/publishes_to...), ImplicitPathExtractor()], embed_model=наш)`, CLI `python -m app.graph_rag sync` (чистка старых граф-узлов этого источника + пересборка из Postgres-чанков, TextNode.id = UUID чанка), `build_graph_retriever(top_k)`.
+- **G2 `app/llama_rag.py`**: `aquery(..., retrieve_mode: "vector"|"graph" = "vector")`; графовая ветка: тот же synthesis (RetrieverQueryEngine/response synthesizer + build_llm), `SearchResult` из graph-нод (score: вектор — cosine, graph — 0.0/synonym-1.0 как есть).
+- **G3 `main.py` + `frontend.py`**: `retrieve_mode` в `ChatRequest`; в сайдбаре Streamlit radio «RAG mode: Vector / Graph»; skor в UI печатается по режиму.
+- **G4 `tests/test_graph_rag.py`**: смоук без LLM: `ImplicitPathExtractor` + засеять чанк-ноды с уникальными именами во временный namespace → `store.delete_llama_nodes` cleanup → retriever вернул чанк-ноды с текстом.
+Контракты (имена функций/сигнатуры) пинятся в промптах агентов; один файл = один агент.
 
-- `pyproject.toml`: + `llama-index-core`, + `llama-index-vector-stores-qdrant`, + `llama-index-llms-openai-like` (резолв проверен: core 0.14.25, qdrant-store 0.10.4, openai-like 0.8.1; риск transitive-wheel на 3.14 и пересечения версий `openai` SDK — проверяю сразу после `uv add`, откатной путь описан ниже).
-- `app/config.py`: + `LLAMA_QDRANT_COLLECTION: str = "llama_doc_chunks"`.
-- `app/llama_rag.py` (новый):
-  - `E5FastEmbed(BaseEmbedding)` — адаптер к embedding_service.
-  - `build_index()` — `QdrantVectorStore` поверх существующего сервера (client/аclient — как требует версия), `VectorStoreInfo` с metadata-полем `service_name` для фильтров, `Collection.from_existing`/`VectorStoreIndex.from_vector_store`.
-  - `sync_from_postgres()` — full rebuild: читает чанки join services → TextNodes (id=UUID, metadata: service_name/service_id/chunk_index/doc_file_path) → truncate коллекции → `await pipeline.arun(...)` через `IngestionPipeline(transformations=[embeddings], vector_store=...)`.
-  - `build_query_engine(top_k, service_filter)` — `OpenAILike(model=LLM_API_BASE-модель, api_base=LLM_API_BASE, api_key=LLM_API_KEY, is_chat_model=True)` + retriever с опциональным `MetadataFilters(service_name=...)` + синтез с нашей prompt-инструкцией.
-  - CLI: `python -m app.llama_rag sync` (запускать после изменений корпуса, как сейчас `graph_neo4j ingest`).
-- `main.py`: в `ChatRequest` поле `mode: Literal["handwritten","llamaindex"] = "handwritten"`; ветвление в `/chat`: handwritten — текущий путь; llamaindex — `build_query_engine().aquery(...)`, `reply = str(response)`, sources из `source_nodes` (score там тоже cosine). Fallback при недоступном LLM — вывод контекста, как сейчас.
-- `tests/test_llama_rag.py`: детерминированный смоук **без LLM**: собрать индекс из 2 фейковых чанков во временной коллекции, embed → retrieve → проверить порядок и `MetadataFilters` по service_name; teardown — удалить коллекцию. Встраивается в текущий pytest-раннер (asyncio auto, session loop).
+### Gate (агент-верификатор, потом я)
+Агент: pytest все, живой `graph_rag sync`, `/chat` в обоих режимах на контрольных вопросах (auth/billing — сверяем с прежними 0.88/0.86),Neo4j-граф против Postgres-чанков, cleanup test-мусора. Я читаю diff и коммичу.
 
-### Проверка (build → run → observe)
+### Волна 2 — удаление самописного (агент)
+`app/graph_extractor.py`, `app/graph_neo4j.py`, JSONB-колонки `entities/relations`, модели `GraphEntity/EntityAlias/GraphEdge/EdgeMention`, шаг извлечения в worker (переходит на graph_rag-синк), `tests/test_graph_schema.py`, секция Graph в README переписывается. Старый Entity/Alias/REL-граф в Neo4j затирается (DETACH DELETE только его labels) — он был порождением самописного стека.
 
-1. `uv add` + импорт всех модулей (первый же шаг вскрывает конфликты версий).
-2. `python -m app.llama_rag sync` → сверить: Postgres-чанков 102 == точек в `llama_doc_chunks`; посмотреть в dashboard localhost:6333 (у llama-точек payload другой формы — наглядно сравнить с нашей ручной коллекцией).
-3. Живой прогон: одинаковые вопросы («recurring payments», «JWT» + filter auth) через `/chat` в обоих режимах — сравнить sources и скоры (должны совпадать с точностью до ANN-рандомизации), reply от 1.5B модели.
-4. `uv run --extra dev pytest` — всё зелёное.
-5. Коммит.
+### Волна 3 — измерение
+`eval/questions.md`: table vector vs graph (synonym / synonym+vector) — выбор default-режима за тобой. Модель 1.5B устраивает, в запасе 7B/9B если извлечение окажется тонким.
 
-### Риски / откатные пути
-
-- Транзитивные wheels llama-index на Python 3.14 — почти наверняка ОК (все pure-python или с свежими wheels), но проверю первым шагом.
-- Пересечение версий пакета `openai` между langchain-openai и llama-index-llms-openai — при конфликте фиксирую версию, в крайнем случае заменяю `OpenAILike` на тонкий свой LLM-адаптер к тому же эндпоинту (тот же паттерн, что с эмбеддингами).
-- Качество ответов 1.5B через дефолтные промпты LlamaIndex хуже нашего — лечится кастомным `ResponseSynthesizer`-шаблоном, входящим в план.
-
-### Что сознательно НЕ делаем сейчас
-
-- Не подключаем PropertyGraphIndex/graph-стор LlamaIndex к Neo4j — следующий этап, после уроков Cypher: наш `graph_neo4j.expand` тогда встроим в A/B как **кастомный retriever** внутри LlamaIndex (и это же даст «третью ветку» сравнения).
-- Не трогаем worker (llama-синхронизация отдельно, чтобы не сдваивать эмбеддинги каждые 60 с).
+### Риски
+- APOC в контейнере может не быть — волна 0 фиксирует, какой конфигурации стор это обходит.
+- wheel neo4j-интеграции на py3.14 — проверка первым шагом, блокер выносится тебе до кода.

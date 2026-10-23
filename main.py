@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -52,6 +53,10 @@ class ChatRequest(BaseModel):
         None, description="Optional microservice name to narrow vector search (e.g., 'billing')"
     )
     top_k: int = Field(default=3, ge=1, le=10, description="Number of context passages to retrieve")
+    retrieve_mode: Literal["vector", "graph"] = Field(
+        default="vector",
+        description="RAG branch: 'vector' = Qdrant semantic search, 'graph' = LlamaIndex PropertyGraphIndex over Neo4j",
+    )
 
 
 class SourceReference(BaseModel):
@@ -80,6 +85,7 @@ async def chat_endpoint(request: ChatRequest):
             question=request.message,
             top_k=request.top_k,
             service_filter=request.service_filter,
+            retrieve_mode=request.retrieve_mode,
         )
     except Exception as e:
         logger.error(f"Error during LlamaIndex query: {e}", exc_info=True)

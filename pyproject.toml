@@ -14,7 +14,9 @@ dependencies = [
     "streamlit>=1.40.0",
     "fastembed>=0.9.0",
     "httpx2>=2.16.0",
-    "neo4j>=6.4.1",
+    # llama-index-graph-stores-neo4j pins neo4j>=5.16,<6; our Neo4j 5.26 server
+    # speaks the same protocol as the 5.x driver.
+    "neo4j>=5.16,<6",
     "qdrant-client>=1.20.0",
     "llama-index-core>=0.14.25",
     "llama-index-vector-stores-qdrant>=0.10.4",
@@ -22,6 +24,7 @@ dependencies = [
     # Upstream 0.7.0 still declares Requires-Python <3.13; that ceiling is
     # stale (pure-Python glue) and the package works on our 3.14 runtime.
     "llama-index-embeddings-fastembed>=0.7.0",
+    "llama-index-graph-stores-neo4j>=0.8.0",
 ]
 
 [project.optional-dependencies]
