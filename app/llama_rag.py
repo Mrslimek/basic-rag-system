@@ -6,7 +6,8 @@ Same infrastructure, different machinery:
   Postgres     = source of truth for chunk text (unchanged, worker-owned).
   Qdrant       = same server, SEPARATE collection (default `llama_doc_chunks`),
                  because QdrantVectorStore writes its own payload shape
-                 (text + nested `metadata.*`), unlike our hand-made points.
+                 (node text + metadata flattened into top-level payload keys),
+                 unlike our hand-made points.
   Embeddings   = the SAME fastembed e5-small service via a BaseEmbedding adapter.
                  Metadata is excluded from the embedded text on purpose, so the
                  vectors are byte-identical to the hand-written pipeline and the
@@ -23,9 +24,9 @@ import sys
 from llama_index.core import VectorStoreIndex
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.llms import LLM
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, MetadataInfo, VectorStoreInfo
-from llama_index.llms.openai_like import OpenAILike
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models as qm
 from sqlalchemy import select
@@ -33,6 +34,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import get_db_context
 from app.embeddings import embedding_service
+from app.llm import SYSTEM_INSTRUCTION, get_chat_model
 from app.models import Service, ServiceDocumentationChunk
 from app.rag_service import SearchResult, rag_service
 from app.vectorstore import get_vectorstore
@@ -47,13 +49,6 @@ settings = get_settings()
 METADATA_KEYS = ("service_name", "service_id", "doc_file_path", "chunk_index")
 METADATA_TYPES = {"service_name": "str", "service_id": "str", "doc_file_path": "str", "chunk_index": "num"}
 FILTER_SERVICE_KEY = "service_name"
-
-SYSTEM_INSTRUCTION = (
-    "You are an expert microservices architecture assistant. "
-    "Answer the user's question using ONLY the provided documentation context below. "
-    "Always cite the microservice name and endpoint paths accurately. "
-    "If the answer cannot be found in the context, explicitly state that."
-)
 
 
 class E5FastEmbed(BaseEmbedding):
@@ -108,7 +103,7 @@ def get_sync_client() -> QdrantClient:
     shared with app.vectorstore — one Qdrant server, two logical connections."""
     global _sync_client
     if _sync_client is None:
-        _sync_client = QdrantClient(url=settings.QDRANT_URL, timeout=30.0)
+        _sync_client = QdrantClient(url=settings.QDRANT_URL, timeout=30)
     return _sync_client
 
 
@@ -156,18 +151,11 @@ def build_index(collection_name: str | None = None) -> VectorStoreIndex:
     return VectorStoreIndex.from_vector_store(store, embed_model=get_llama_embedding())
 
 
-def build_llm() -> OpenAILike:
-    """Same llama.cpp endpoint as langchain's ChatOpenAI, LlamaIndex's client."""
-    return OpenAILike(
-        model=settings.LLM_MODEL,
-        api_base=settings.LLM_API_BASE,
-        api_key=settings.LLM_API_KEY,
-        temperature=0.2,
-        max_retries=1,
-        timeout=60.0,
-        is_chat_model=True,
-        system_prompt=SYSTEM_INSTRUCTION,
-    )
+def build_llm() -> LLM:
+    """The project-wide LLM client from app/llm.py, with the shared answer-policy
+    prompt baked in as system_prompt — so the query engine's synthesis uses the
+    exact same instructions as the hand-written path."""
+    return get_chat_model(temperature=0.2, system_prompt=SYSTEM_INSTRUCTION)
 
 
 async def sync_from_postgres() -> dict[str, int]:
@@ -267,7 +255,7 @@ async def aquery(
     collection_name: str | None = None,
 ) -> tuple[str, list[SearchResult]]:
     """
-    Library-first query: retriever + ResponseSynthesizer + OpenAILike, all LlamaIndex.
+    Library-first query: retriever + ResponseSynthesizer + shared LLM client, all LlamaIndex.
 
     Same graceful fallback as the hand-written endpoint when the local LLM is
     offline: retrieval still answers, the raw context is returned instead.

@@ -2,13 +2,13 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Literal
 from fastapi import Depends, FastAPI, HTTPException
-from langchain_core.messages import HumanMessage, SystemMessage
+from llama_index.core.llms import ChatMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db_session, init_db
-from app.llm import get_chat_model
+from app.llm import SYSTEM_INSTRUCTION, get_chat_model
 from app.rag_service import rag_service
 from app.vectorstore import get_vectorstore
 from app import llama_rag
@@ -57,7 +57,7 @@ class ChatRequest(BaseModel):
     )
     top_k: int = Field(default=3, ge=1, le=10, description="Number of context passages to retrieve")
     mode: Literal["handwritten", "llamaindex"] = Field(
-        default="handwritten",
+        default="llamaindex",
         description="Retrieval pipeline: hand-written Qdrant+SQL path, or the LlamaIndex framework path",
     )
 
@@ -77,27 +77,23 @@ class ChatResponse(BaseModel):
 
 async def query_llm(prompt: str, context: str) -> str:
     """
-    Sends retrieved context and prompt to local Ollama or OpenAI-compatible endpoint.
-    Falls back gracefully to a structured synthesis if the local LLM is offline.
+    Sends retrieved context and prompt to the local OpenAI-compatible endpoint
+    through the shared LlamaIndex client. Falls back gracefully to a structured
+    synthesis if the local LLM is offline.
     """
-    system_instruction = (
-        "You are an expert microservices architecture assistant. "
-        "Answer the user's question using ONLY the provided documentation context below. "
-        "Always cite the microservice name and endpoint paths accurately. "
-        "If the answer cannot be found in the context, explicitly state that."
-    )
-
     full_user_message = f"Documentation Context:\n{context}\n\nQuestion:\n{prompt}"
 
     llm = get_chat_model(temperature=0.2)
     try:
-        response = await llm.ainvoke(
+        response = await llm.achat(
             [
-                SystemMessage(content=system_instruction),
-                HumanMessage(content=full_user_message),
+                ChatMessage(role="system", content=SYSTEM_INSTRUCTION),
+                ChatMessage(role="user", content=full_user_message),
             ]
         )
-        return response.text
+        # response.message is a ChatMessage; take its .content.
+        # str(ChatMessage) would prepend "assistant: " — a role label, not text.
+        return response.message.content
     except Exception as exc:
         logger.info(f"Local LLM not reachable at {settings.LLM_API_BASE} ({exc}). Using direct context synthesis.")
 

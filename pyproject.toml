@@ -1,7 +1,7 @@
 [project]
 name = "rag-docs-service"
 version = "0.1.0"
-description = "Microservices documentation RAG assistant with FastAPI, pgvector, Taskiq, and Streamlit"
+description = "Microservices documentation RAG assistant with FastAPI, LlamaIndex, Qdrant, Neo4j, Taskiq, and Streamlit"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -13,7 +13,6 @@ dependencies = [
     "taskiq>=0.11.0",
     "streamlit>=1.40.0",
     "fastembed>=0.9.0",
-    "langchain-openai>=1.7.2",
     "httpx2>=2.16.0",
     "neo4j>=6.4.1",
     "qdrant-client>=1.20.0",
