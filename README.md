@@ -8,26 +8,50 @@ A production-grade, self-contained local prototype of a microservices documentat
 
 ```mermaid
 flowchart LR
-    Docs["docs_mock/*.md"] --> Worker["Taskiq Worker (Sync / Hash check)"]
-    Worker --> PG[("PostgreSQL\n(documents + graph JSONB)")]
-    Worker --> QD[("Qdrant\n(doc_chunks vectors)")]
-    Worker --> NEO[("Neo4j\n(service graph)")]
+    Docs["docs_mock/*.md"] -->|"every 60s\nSHA-256 hash check"| Worker["Taskiq Worker\n(app/worker.py)"]
+    Worker --> PG[("PostgreSQL\nchunk text = source of truth")]
+    Worker -->|"IngestionPipeline"| QD[("Qdrant\ncollection: doc_chunks")]
+
+    PG -->|"app.graph_rag sync\nLLM relation extraction"| NEO[("Neo4j\nknowledge graph")]
 
     UI["Streamlit UI\n(frontend.py)"] --> API["FastAPI /chat\n(main.py)"]
-    API --> RAG["LlamaIndex pipeline\n(app/llama_rag.py)"]
-    RAG --> QD
-    RAG --> LLM["Local LLM (Ollama / OpenAI-compatible)"]
+    API --> RAG["app/llama_rag.py\none LlamaIndex flow"]
+    RAG -->|"retrieve_mode = vector"| QD
+    RAG -->|"retrieve_mode = graph"| NEO
+    RAG --> LLM["LLM synthesis\n(Ollama / OpenAI-compatible)"]
 ```
 
-1. **Single LlamaIndex retrieval pipeline**: `/chat` runs one path — a LlamaIndex retriever over the Qdrant `doc_chunks` collection with LLM synthesis (`app/llama_rag.aquery`). Postgres remains the source of truth for documents and provenance.
-2. **Asymmetric E5 Retrieval**:
+1. **One LlamaIndex flow, two retrievals**: `/chat` takes `retrieve_mode: "vector" | "graph"`. Vector mode queries the Qdrant `doc_chunks` collection; graph mode queries a LlamaIndex `PropertyGraphIndex` over Neo4j. Both branches share the same response synthesizer and LLM client, so switching retrieval strategies never changes how answers are composed. The mode selection lives entirely in `app/llama_rag.py`; nothing else knows which branch ran.
+2. **Postgres is the source of truth for chunk text**: the worker persists every document and its chunks in PostgreSQL first. Qdrant and Neo4j are derived stores that can always be rebuilt from Postgres.
+3. **Asymmetric E5 retrieval**:
    - Stored document chunks are prefixed with `"passage: "`.
    - Incoming user questions are prefixed with `"query: "`.
-   This aligns vectors in the contrastive embedding subspace learned by the E5 model family.
-3. **Deterministic Paragraph Chunking**:
-   Technical markdown specifications contain structured endpoint descriptions and JSON/YAML code examples. Splitting by paragraphs (`\n\n+`) prevents cutting schema bodies or tables midway.
-4. **Taskiq Background Worker**:
-   Scans `docs_mock/*.md` periodically, computes SHA-256 hashes to detect updates, and atomically re-indexes modified microservice documentation.
+   This aligns vectors in the contrastive embedding subspace learned by the E5 model family. Prefixing is applied once in `app/embeddings.py`, so every indexing and query path produces interchangeable vectors.
+4. **Deterministic paragraph chunking**: technical markdown specifications contain structured endpoint descriptions and JSON/YAML code examples. Splitting by paragraphs (`\n\n+`) prevents cutting schema bodies or tables midway.
+5. **Taskiq background worker**: a scheduler triggers every 60 seconds, scans `docs_mock/*.md`, computes SHA-256 hashes to detect changes, replaces changed documents' chunks in Postgres atomically, and re-embeds them into Qdrant through the LlamaIndex `IngestionPipeline`.
+6. **The knowledge graph is built separately from the vector index**: a full rebuild is triggered on demand with `uv run python -m app.graph_rag sync`. It reads chunks from Postgres and extracts entities and relationships with an LLM inside the index via LlamaIndex's `SchemaLLMPathExtractor`, writing the result to Neo4j. Retrieval must run against an APOC-enabled Neo4j; `docker-compose.yml` provisions it with `NEO4J_PLUGINS: '["apoc"]'`.
+
+---
+
+## 🔄 Data Flows
+
+**Ingestion — automatic, every 60 seconds (worker):**
+
+```
+docs_mock/*.md → hash check → paragraph chunks → PostgreSQL → IngestionPipeline → Qdrant (doc_chunks)
+```
+
+**Graph rebuild — manual, on demand:**
+
+```
+uv run python -m app.graph_rag sync → read chunks from PostgreSQL → LLM extraction (SchemaLLMPathExtractor) → Neo4j (full rebuild)
+```
+
+**Query — per request:**
+
+```
+Streamlit sidebar (vector | graph) → POST /chat { retrieve_mode } → LlamaIndex retriever (Qdrant or Neo4j) → shared LLM synthesis → answer + sources
+```
 
 ---
 
@@ -37,7 +61,7 @@ flowchart LR
 - **Python 3.14** (configured via `.python-version`)
 - **[uv](https://docs.astral.sh/uv/)** package manager
 - **Docker** (for PostgreSQL, Qdrant, and Neo4j via docker-compose)
-- *(Optional)* **Ollama** running locally with `llama3.2` or any OpenAI-compatible API (`http://localhost:11434/v1`).
+- *(Optional)* **Ollama** running locally with `llama3.2` or any OpenAI-compatible API (`http://localhost:11434/v1`). Graph sync and answer synthesis both call the LLM, so one must be reachable for those steps.
 
 ---
 
@@ -47,6 +71,9 @@ Create a `.env` file (or edit [app/config.py](file:///Users/viktor/Projects/pyth
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/rag_docs_db
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=doc_chunks
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=graphrag123
 EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small
 LLM_API_BASE=http://localhost:11434/v1
 LLM_API_KEY=ollama
@@ -67,7 +94,7 @@ uv run --extra dev pytest
 ### 4. Running the Services
 
 #### Option 1: One-Command Startup with Docker Compose (Recommended)
-Start PostgreSQL, Qdrant, Neo4j, the Taskiq background worker, the FastAPI backend, and the Streamlit UI with a single command:
+Start PostgreSQL, Qdrant (v1.20), the APOC-enabled Neo4j 5.26, the Taskiq background worker, the FastAPI backend, and the Streamlit UI with a single command:
 ```bash
 docker compose up --build
 ```
@@ -75,19 +102,30 @@ docker compose up --build
 - **FastAPI Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - *Note: The `api` container automatically connects to a local Ollama instance on your host machine via `http://host.docker.internal:11434/v1`.*
 
----
-
 #### Option 2: Running Locally via `uv`
 
-1. **Start Taskiq Worker (Syncs & Embeds Markdown Docs)**:
+1. **Start the infrastructure** (Postgres, Qdrant, Neo4j):
+   ```bash
+   docker compose up -d
+   ```
+2. **Start the Taskiq Worker** (syncs and embeds markdown docs every 60 seconds):
    ```bash
    uv run python -m app.worker
    ```
-2. **Start FastAPI Backend**:
+3. **Start the FastAPI backend**:
    ```bash
    uv run uvicorn main:app --reload --port 8000
    ```
-3. **Start Streamlit Chat UI**:
+4. **Start the Streamlit chat UI**:
    ```bash
    uv run streamlit run frontend.py --server.port 8501
    ```
+
+---
+
+### 5. Building the Knowledge Graph
+Vector search works as soon as the worker has indexed the docs. The graph branch needs one explicit build step, which fully rebuilds the Neo4j graph from the chunks stored in Postgres using LLM-based extraction:
+```bash
+uv run python -m app.graph_rag sync
+```
+Re-run it whenever documentation changes materially; it wipes and rebuilds the graph in place.

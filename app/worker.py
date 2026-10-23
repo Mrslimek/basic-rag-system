@@ -15,7 +15,6 @@ from app.chunker import chunk_markdown_paragraphs
 from app.config import get_settings
 from app.database import get_db_context, init_db
 from app.embeddings import get_embedding_model
-from app.graph_extractor import GraphExtractor
 from app.llama_rag import METADATA_KEYS, build_vector_store, ensure_collection
 from app.models import Service, ServiceDocumentationChunk
 
@@ -159,20 +158,14 @@ async def sync_document_file(file_path: Path) -> bool:
             session.add(service_record)
             await session.flush()  # populate service_record.id
 
-        # 3. Insert chunk rows (text + graph JSONB in Postgres).
-        # Extraction failure degrades to an empty fragment via GraphExtractor,
-        # so the sync always proceeds.
-        extractor = GraphExtractor()
+        # 3. Insert chunk rows (pure text in Postgres). Graph extraction happens
+        # in app/graph_rag's LlamaIndex pipeline against Neo4j, not here.
         chunk_rows: list[ServiceDocumentationChunk] = []
         for chunk_data in chunks:
-            extraction = await extractor.extract(chunk_data.content)
-
             chunk_row = ServiceDocumentationChunk(
                 service_id=service_record.id,
                 chunk_index=chunk_data.index,
                 content=chunk_data.content,
-                entities=extraction["entities"],
-                relations=extraction["relations"],
             )
             session.add(chunk_row)
             chunk_rows.append(chunk_row)
