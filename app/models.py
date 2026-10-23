@@ -48,8 +48,8 @@ class ServiceDocumentationChunk(Base):
     """
     Represents a discrete semantic chunk of a microservice's documentation.
     This row is the source of truth for chunk TEXT and graph extraction results;
-    the embedding lives in Qdrant as a point with the SAME uuid id
-    (see app/vectorstore.py).
+    the embedding lives in Qdrant as a point with the SAME uuid id, indexed by
+    the LlamaIndex pipeline (see app/llama_rag.py).
     """
     __tablename__ = "service_documentation_chunks"
 

@@ -1,7 +1,6 @@
 services:
   db:
-    # Plain PostgreSQL 18: vectors now live in Qdrant, Postgres keeps documents + graph JSONB.
-    # (Previously pgvector/pgvector:pg18 — the extension is dropped by app/backfill_qdrant.py.)
+    # Plain PostgreSQL 18: vectors live in Qdrant, Postgres keeps documents + graph JSONB.
     image: postgres:18-alpine
     container_name: rag_docs_db
     restart: unless-stopped

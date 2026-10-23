@@ -11,7 +11,8 @@ from app.config import get_settings
 settings = get_settings()
 
 # Engine creation: Postgres owns documents/chunks/graph tables only.
-# Vectors live in Qdrant (app/vectorstore.py), so no pgvector codecs are registered here.
+# Vectors live in Qdrant, written by the LlamaIndex pipeline (app/llama_rag.py),
+# so no pgvector codecs are registered here.
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
@@ -60,7 +61,7 @@ async def init_db(target_engine: AsyncEngine | None = None) -> None:
     """
     Bootstrap database:
     1. Creates all tables defined in models.py if they do not exist.
-    Vectors are NOT stored here anymore (Qdrant owns them, see app/vectorstore.py),
+    Vectors are not stored here at all (Qdrant owns them via app/llama_rag.py),
     so the pgvector extension is no longer required.
     """
     from app.models import Base

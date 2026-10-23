@@ -19,6 +19,9 @@ dependencies = [
     "llama-index-core>=0.14.25",
     "llama-index-vector-stores-qdrant>=0.10.4",
     "llama-index-llms-openai-like>=0.8.1",
+    # Upstream 0.7.0 still declares Requires-Python <3.13; that ceiling is
+    # stale (pure-Python glue) and the package works on our 3.14 runtime.
+    "llama-index-embeddings-fastembed>=0.7.0",
 ]
 
 [project.optional-dependencies]

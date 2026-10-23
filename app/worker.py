@@ -3,17 +3,21 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.schema import TextNode
+from qdrant_client import AsyncQdrantClient, models
 from sqlalchemy import delete, select
 from taskiq import InMemoryBroker, TaskiqScheduler
 from taskiq.schedule_sources import LabelScheduleSource
 
-from app.graph_extractor import GraphExtractor
 from app.chunker import chunk_markdown_paragraphs
 from app.config import get_settings
 from app.database import get_db_context, init_db
-from app.embeddings import embedding_service
+from app.embeddings import get_embedding_model
+from app.graph_extractor import GraphExtractor
+from app.llama_rag import METADATA_KEYS, build_vector_store, ensure_collection
 from app.models import Service, ServiceDocumentationChunk
-from app.vectorstore import ChunkVector, get_vectorstore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docs_sync_worker")
@@ -29,10 +33,69 @@ scheduler = TaskiqScheduler(
     sources=[LabelScheduleSource(broker)],
 )
 
+# Raw async client only for point deletions: llama-index-core 0.1x's
+# IngestionPipeline.arun has no delete_ids kwarg (pipeline.py:746 signature),
+# so orphan cleanup goes straight to Qdrant by point id.
+_qdrant_client: AsyncQdrantClient | None = None
+
+
+def get_qdrant_client() -> AsyncQdrantClient:
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30.0)
+    return _qdrant_client
+
 
 def compute_file_hash(content: str) -> str:
     """Compute SHA256 hash of file content to detect document changes."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+async def delete_old_vectors(old_chunk_ids: list) -> None:
+    """Drop the Qdrant points of previously synced chunks.
+
+    The re-synced chunks get NEW uuids, so without this the old points would
+    linger as orphans: vector hits pointing at Postgres rows that no longer
+    exist. Point ids are the chunk UUIDs (str), set at indexing time.
+    """
+    if not old_chunk_ids:
+        return
+    await get_qdrant_client().delete(
+        collection_name=settings.QDRANT_COLLECTION,
+        points_selector=models.PointIdsList(points=[str(cid) for cid in old_chunk_ids]),
+    )
+
+
+async def index_chunks(
+    chunk_rows: list[ServiceDocumentationChunk],
+    service_record: Service,
+    file_path: Path,
+) -> None:
+    """Embed and upsert chunk rows into Qdrant via a LlamaIndex pipeline.
+
+    One node per chunk, keyed by the chunk's own UUID, so Postgres and Qdrant
+    share the same id (a cross-store FK). Upsert is idempotent by id.
+    """
+    nodes = [
+        TextNode(
+            id_=str(row.id),
+            text=row.content,
+            metadata={
+                "service_name": service_record.name,
+                "service_id": str(service_record.id),
+                "doc_file_path": str(file_path),
+                "chunk_index": row.chunk_index,
+            },
+            # Provenance fields help retrieval filtering, not the vector itself.
+            excluded_embed_metadata_keys=list(METADATA_KEYS),
+        )
+        for row in chunk_rows
+    ]
+    pipeline = IngestionPipeline(
+        transformations=[get_embedding_model()],
+        vector_store=build_vector_store(),
+    )
+    await pipeline.arun(nodes=nodes)
 
 
 async def sync_document_file(file_path: Path) -> bool:
@@ -65,26 +128,26 @@ async def sync_document_file(file_path: Path) -> bool:
             logger.warning(f"No valid markdown chunks extracted from {file_path}")
             return False
 
-        # 2. Generate embeddings
-        chunk_texts = [c.content for c in chunks]
-        embeddings = await embedding_service.embed_passages(chunk_texts)
-
-        # 3. Upsert Service record
+        # 2. Upsert Service record
+        old_chunk_ids: list = []
         if existing_service:
             existing_service.doc_hash = content_hash
             existing_service.doc_file_path = str(file_path)
             existing_service.last_synced_at = datetime.now(timezone.utc)
             service_record = existing_service
+            # Capture old chunk ids BEFORE deleting: they double as the Qdrant
+            # point ids used for orphan cleanup below.
+            old_chunk_ids = list((await session.execute(
+                select(ServiceDocumentationChunk.id).where(
+                    ServiceDocumentationChunk.service_id == service_record.id
+                )
+            )).scalars().all())
             # Delete old chunks
             await session.execute(
                 delete(ServiceDocumentationChunk).where(
                     ServiceDocumentationChunk.service_id == service_record.id
                 )
             )
-            # ...and their vectors: the re-synced chunks get NEW uuids, so without
-            # this delete the old Qdrant points would linger as orphan rows of the
-            # vector index (points whose Postgres row no longer exists).
-            await get_vectorstore().delete_by_service(str(service_record.id))
         else:
             service_record = Service(
                 name=service_name,
@@ -96,11 +159,12 @@ async def sync_document_file(file_path: Path) -> bool:
             session.add(service_record)
             await session.flush()  # populate service_record.id
 
-        # 4. Insert chunk rows (text + graph JSONB in Postgres), then push their
-        # vectors to Qdrant under the same uuid ids (upsert = idempotent by id).
+        # 3. Insert chunk rows (text + graph JSONB in Postgres).
+        # Extraction failure degrades to an empty fragment via GraphExtractor,
+        # so the sync always proceeds.
         extractor = GraphExtractor()
         chunk_rows: list[ServiceDocumentationChunk] = []
-        for chunk_data, emb in zip(chunks, embeddings):
+        for chunk_data in chunks:
             extraction = await extractor.extract(chunk_data.content)
 
             chunk_row = ServiceDocumentationChunk(
@@ -115,17 +179,10 @@ async def sync_document_file(file_path: Path) -> bool:
 
         await session.flush()  # populate chunk_row.id (python-side uuid4 defaults)
 
-        await get_vectorstore().upsert_chunks([
-            ChunkVector(
-                chunk_id=row.id,
-                service_id=str(service_record.id),
-                service_name=service_name,
-                doc_file_path=str(file_path),
-                chunk_index=row.chunk_index,
-                embedding=emb,
-            )
-            for row, emb in zip(chunk_rows, embeddings)
-        ])
+        # 4. Vector side: drop the previous run's points, then embed + upsert
+        # the new ones through the LlamaIndex ingestion pipeline.
+        await delete_old_vectors(old_chunk_ids)
+        await index_chunks(chunk_rows, service_record, file_path)
 
         await session.commit()
         logger.info(
@@ -170,7 +227,8 @@ async def run_worker() -> None:
     """Entrypoint for running the worker and scheduler together."""
     logger.info("Initializing database schemas and Qdrant collection...")
     await init_db()
-    await get_vectorstore().ensure_collection()
+    # ensure_collection is sync DDL; offload so the event loop stays free.
+    await asyncio.to_thread(ensure_collection, settings.QDRANT_COLLECTION)
     logger.info("Running initial documentation sync immediately on startup...")
     await sync_docs_task()
 

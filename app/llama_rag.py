@@ -1,18 +1,21 @@
 """
-LlamaIndex implementation of the RAG pipeline, running in parallel to the
-hand-written one (app/rag_service.py) for A/B comparison.
+THE RAG pipeline — LlamaIndex is the single retrieval interface.
 
-Same infrastructure, different machinery:
-  Postgres     = source of truth for chunk text (unchanged, worker-owned).
-  Qdrant       = same server, SEPARATE collection (default `llama_doc_chunks`),
-                 because QdrantVectorStore writes its own payload shape
-                 (node text + metadata flattened into top-level payload keys),
-                 unlike our hand-made points.
-  Embeddings   = the SAME fastembed e5-small service via a BaseEmbedding adapter.
-                 Metadata is excluded from the embedded text on purpose, so the
-                 vectors are byte-identical to the hand-written pipeline and the
-                 two retrievers' scores are directly comparable.
-  LLM          = same local llama.cpp endpoint, through llama-index-llms-openai-like.
+There is exactly one pipeline here: the hand-written retriever and any
+parallel A/B pipeline have been removed; a future A/B comparison will be
+vector-vs-graph retrieval *inside* this module, not competing stacks.
+
+  Postgres   = source of truth for chunk text (unchanged, worker-owned).
+  Qdrant     = ONE collection (default `doc_chunks`). QdrantVectorStore writes
+               its own payload shape (node text + metadata flattened into
+               top-level payload keys) — the hand-made points the ingest
+               worker used to create are superseded by `sync` below.
+  Embeddings = the process-wide e5-small model from app.embeddings
+               (get_embedding_model) — the same ONNX weights, prefixes and
+               normalization as always, so vectors stay interchangeable with
+               existing points. Metadata is excluded from the embedded text on
+               purpose: identical input -> identical vector.
+  LLM        = same local llama.cpp endpoint, through llama-index-llms-openai-like.
 
 Run the index build after corpus changes:
     uv run python -m app.llama_rag sync
@@ -20,6 +23,7 @@ Run the index build after corpus changes:
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.base.embeddings.base import BaseEmbedding
@@ -28,16 +32,14 @@ from llama_index.core.llms import LLM
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, MetadataInfo, VectorStoreInfo
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient, models as qm
+from qdrant_client import AsyncQdrantClient, QdrantClient, models as qm
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import get_db_context
-from app.embeddings import embedding_service
+from app.embeddings import get_embedding_model
 from app.llm import SYSTEM_INSTRUCTION, get_chat_model
 from app.models import Service, ServiceDocumentationChunk
-from app.rag_service import SearchResult, rag_service
-from app.vectorstore import get_vectorstore
 
 logger = logging.getLogger("llama_rag")
 settings = get_settings()
@@ -51,65 +53,61 @@ METADATA_TYPES = {"service_name": "str", "service_id": "str", "doc_file_path": "
 FILTER_SERVICE_KEY = "service_name"
 
 
-class E5FastEmbed(BaseEmbedding):
-    """
-    Adapter: our async fastembed service, wrapped as a LlamaIndex embedding
-    provider — the standard "plug your own provider into the framework" pattern.
-    Guarantees the same vectors (incl. e5 asymmetric prefixes 'query: '/
-    'passage: ') as the hand-written path, so A/B scores are comparable.
-    """
-
-    def _get_text_embedding(self, text: str) -> list[float]:
-        # Sync API is only usable outside a running loop; our paths are all async.
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(embedding_service.embed_passage(text))
-        raise RuntimeError("E5FastEmbed sync API cannot be used inside a running event loop")
-
-    def _get_query_embedding(self, query: str) -> list[float]:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(embedding_service.embed_query(query))
-        raise RuntimeError("E5FastEmbed sync API cannot be used inside a running event loop")
-
-    async def _aget_text_embedding(self, text: str) -> list[float]:
-        return await embedding_service.embed_passage(text)
-
-    async def _aget_text_embeddings(self, texts: list[str]) -> list[list[float]]:
-        # Batch: one fastembed inference call for many nodes (used by IngestionPipeline).
-        return await embedding_service.embed_passages(texts)
-
-    async def _aget_query_embedding(self, query: str) -> list[float]:
-        return await embedding_service.embed_query(query)
+@dataclass(frozen=True)
+class SearchResult:
+    """A retrieved documentation chunk with source service provenance — the
+    common currency between retrieval, /chat answering and any future A/B."""
+    service_name: str
+    doc_file_path: str
+    chunk_index: int
+    content: str
+    similarity_score: float
 
 
-_llama_embedding: E5FastEmbed | None = None
+def build_context(search_results: list[SearchResult]) -> str:
+    """Citation-friendly context for LLM prompts: every block carries its
+    provenance so the model cannot blend endpoints across services."""
+    if not search_results:
+        return "No relevant documentation found."
+    blocks = [
+        f"### [Source {i}] Microservice: {res.service_name} "
+        f"(File: {res.doc_file_path}, Chunk #{res.chunk_index}, Score: {res.similarity_score:.4f})\n"
+        f"{res.content}"
+        for i, res in enumerate(search_results, start=1)
+    ]
+    return "\n\n---\n\n".join(blocks)
 
 
-def get_llama_embedding() -> E5FastEmbed:
-    global _llama_embedding
-    if _llama_embedding is None:
-        _llama_embedding = E5FastEmbed()
-    return _llama_embedding
+def get_llama_embedding() -> BaseEmbedding:
+    """The process-wide embedding model, owned by app.embeddings."""
+    return get_embedding_model()
 
 
 _sync_client: QdrantClient | None = None
 
 
 def get_sync_client() -> QdrantClient:
-    """Sync client for DDL ops (create/delete collection). The async client is
-    shared with app.vectorstore — one Qdrant server, two logical connections."""
+    """Sync client for DDL ops (create/delete collection)."""
     global _sync_client
     if _sync_client is None:
         _sync_client = QdrantClient(url=settings.QDRANT_URL, timeout=30)
     return _sync_client
 
 
+_async_client: AsyncQdrantClient | None = None
+
+
+def get_async_client() -> AsyncQdrantClient:
+    """Async client for point ops — llama_rag owns its Qdrant connections."""
+    global _async_client
+    if _async_client is None:
+        _async_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30.0)
+    return _async_client
+
+
 def ensure_collection(collection_name: str) -> None:
-    """Idempotent DDL mirroring app/vectorstore.ensure_collection: cosine over
-    unit-normalized vectors + payload index for the filterable metadata key."""
+    """Idempotent DDL: cosine over unit-normalized vectors + payload index for
+    the filterable metadata key."""
     client = get_sync_client()
     if not client.collection_exists(collection_name):
         client.create_collection(
@@ -126,12 +124,12 @@ def ensure_collection(collection_name: str) -> None:
 
 
 def build_vector_store(collection_name: str | None = None) -> QdrantVectorStore:
-    name = collection_name or settings.LLAMA_QDRANT_COLLECTION
+    name = collection_name or settings.QDRANT_COLLECTION
     ensure_collection(name)
     return QdrantVectorStore(
         collection_name=name,
         client=get_sync_client(),
-        aclient=get_vectorstore().client,
+        aclient=get_async_client(),
         text_key="text",
         metadata_config=VectorStoreInfo(
             metadata_info=[
@@ -153,22 +151,21 @@ def build_index(collection_name: str | None = None) -> VectorStoreIndex:
 
 def build_llm() -> LLM:
     """The project-wide LLM client from app/llm.py, with the shared answer-policy
-    prompt baked in as system_prompt — so the query engine's synthesis uses the
-    exact same instructions as the hand-written path."""
+    prompt baked in as system_prompt."""
     return get_chat_model(temperature=0.2, system_prompt=SYSTEM_INSTRUCTION)
 
 
 async def sync_from_postgres() -> dict[str, int]:
     """
-    Full re-index of the LlamaIndex collection from Postgres chunks.
+    Full rebuild of the LlamaIndex index into the Qdrant collection.
 
     Why full rebuild instead of incremental upsert: worker resyncs replace chunk
     rows with NEW uuids, so the old node ids would dangle — same orphan problem
     we solved with delete_by_service in app/worker.py, solved here by rebuild.
-    Node id = chunk UUID keeps the cross-store join key identical to the
-    hand-written points, so the two collections are row-for-row comparable.
+    Node id = chunk UUID keeps the cross-store join key stable: a Qdrant point
+    id resolves to exactly one Postgres chunk row.
     """
-    name = settings.LLAMA_QDRANT_COLLECTION
+    name = settings.QDRANT_COLLECTION
     async with get_db_context() as session:
         rows = (
             await session.execute(
@@ -234,8 +231,8 @@ def build_query_engine(
 
 
 def _nodes_to_results(nodes: list[NodeWithScore]) -> list[SearchResult]:
-    """Map LlamaIndex nodes back into OUR SearchResult shape — so /chat, context
-    formatting and the A/B comparison use one common currency between pipelines."""
+    """Map LlamaIndex nodes into the SearchResult shape — one common currency
+    for /chat, context formatting and any future A/B."""
     return [
         SearchResult(
             service_name=n.node.metadata.get("service_name", "?"),
@@ -257,8 +254,8 @@ async def aquery(
     """
     Library-first query: retriever + ResponseSynthesizer + shared LLM client, all LlamaIndex.
 
-    Same graceful fallback as the hand-written endpoint when the local LLM is
-    offline: retrieval still answers, the raw context is returned instead.
+    When the local LLM is offline, retrieval still answers: the citation-formatted
+    raw context is returned instead.
     """
     engine = build_query_engine(top_k=top_k, service_filter=service_filter, collection_name=collection_name)
     try:
@@ -269,7 +266,7 @@ async def aquery(
         logger.info(f"LlamaIndex LLM call failed ({exc}); falling back to retrieved context.")
         nodes = await engine.retriever.aretrieve(question)
         sources = _nodes_to_results(list(nodes))
-        context = rag_service.build_context(sources)
+        context = build_context(sources)
         reply = (
             "*(Note: Local LLM was unreachable; LlamaIndex retrieval shown directly)*\n\n"
             + context

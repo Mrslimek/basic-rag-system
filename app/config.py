@@ -14,17 +14,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database Configuration (PostgreSQL: documents + graph extraction JSONB, no more vectors)
+    # Database Configuration (PostgreSQL: source of truth for documents + graph extraction JSONB)
     # Using asyncpg driver for asynchronous database I/O
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/rag_docs_db"
 
-    # Qdrant vector store (replaces the pgvector column)
+    # Qdrant vector store (single collection used by the LlamaIndex pipeline)
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION: str = "doc_chunks"
 
-    # LlamaIndex pipeline uses its own collection on the same Qdrant server
-    LLAMA_QDRANT_COLLECTION: str = "llama_doc_chunks"
-    
     # Embedding Model Configuration
     # intfloat/multilingual-e5-small produces 384-dimensional dense vectors
     EMBEDDING_MODEL_NAME: str = "intfloat/multilingual-e5-small"
