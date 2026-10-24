@@ -42,3 +42,29 @@ No LLM flakes occurred (0 retries, 0 retrieval-fallback replies across all 40 ru
 - **Multi-hop**: contrary to the usual GraphRAG expectation, vector still wins both metrics (55% vs 38% sources, 60% vs 33% key terms). Vector filled all 4 slots on every question; the graph retriever returned ≤2 source nodes on 14 of 20 runs (e.g. multi-hop Q13/Q17/Q19/Q20, single-hop Q2/Q7), so hop coverage never materialized into retrieved context; its single clear win is Q19, where the typed-edge listing produced a better dependency chain than vector's billing-only chunks.
 - **Tie notes**: many single-hop cells tie at 100%/100% because the 1.5B model is terse and sometimes hallucinates the literal even when the right chunk was retrieved (e.g. Q4 `payment_intent_id`, Q7 `analytics.metrics.live` in *both* modes) — key_terms_hit there measures answer fidelity, not retrieval.
 - **Recommendation**: keep `retrieve_mode="vector"` as the default. The graph branch is not yet worth its extra LLM round-trips (LLMSynonymRetriever); revisit after improving graph retriever text recall (e.g. raise sub-retriever limit / always merge chunk neighbors into top_k text nodes).
+
+## Round 2 — MarkdownNodeParser section chunking + model/limit fixes (2026-10-24)
+
+Context: full rebuild from scratch — chunking switched to LlamaIndex `MarkdownNodeParser` (102 → 52 chunks, headings kept inside chunk text), Postgres/Qdrant/Neo4j wiped and rebuilt. Graph stability fixes along the way: extractor `max_tokens` cap (kills the 1.5B repetition loops), client timeout 60s→300s, `raise_on_error=False` (a broken chunk skips instead of aborting sync), and `excluded_llm_metadata_keys` (service_id/doc_file_path no longer leak into the extraction prompt, where the model was extracting UUIDs and repo paths as entities).
+
+Sample: 5 multi-hop questions (Q12, Q14, Q15, Q17, Q20), both modes, top_k=4. Grading identical to Round 1 (sources_hit vs expected services; key_terms_hit = case-insensitive literals from Expected Answer). Scores are % of achievable hits (sources /13, terms /15). **Not directly comparable to Round 1: different chunking, different chunk count.**
+
+| Q | expected sources | v1.5B vec src | v1.5B vec terms | v1.5B graph src | v1.5B graph terms | v8B vec src | v8B vec terms | v8B graph src | v8B graph terms |
+|---|---|---|---|---|---|---|---|---|---|
+| Q12 | notification, auth | 50% | 33% | 50% | 33% | 50% | 33% | 50% | 33% |
+| Q14 | ledger, analytics, billing | 33% | 33% | 33% | 33% | 33% | 33% | 33% | 33% |
+| Q15 | user_profile, search | 100% | 100% | 50% | 33% | 100% | 0% | 50% | 100% |
+| Q17 | payment_gateway, notification, user_profile | 67% | 33% | 33% | 33% | 67% | 0% | 33% | 0% |
+| Q20 | notification, user_profile, auth | 67% | 33% | 67% | 0% | 67% | 0% | 67% | 33% |
+| **Sources avg (5 multi-hop)** | — | **62%** | — | **46%** | — | **62%** | — | **46%** | — |
+| **Key terms avg (5 multi-hop)** | — | — | **47%** | — | **27%** | — | **13%** | — | **40%** |
+
+Graph after the 8B + prompt fixes: 27 entities, 17 SERVICE / 6 DATABASE / 4 ENDPOINT; 14 semantic edges (6 STORES_IN, 6 USES, 2 PROVIDES) — typed STORES_IN edges the 1.5B never produced, and no UUID/path garbage after the metadata-leak fix.
+
+## Conclusion (round 2)
+
+- **Multi-hop: vector still wins retrieval coverage** (62% vs 46% sources) — same direction as Round 1. The graph retriever under-fills top_k: on Q14/Q17 it returned chunks of the wrong services.
+- **8B lifted graph answer quality**: key_terms 27% → 40% (graph), flipping the Round-1 margin — graph replies now often contain the literals when context arrives (Q15: full 100% on `acme-dwh`/S3/avatar via STORES_IN edges), while refusing cleanly when it does not.
+- **8B lowered vector answer quality** (47% → 13% terms): verbose "Based on the provided context…" replies paraphrase the literals away; substring grading punishes this. Retrieval (sources) is unchanged — the vector branch never depended on the model.
+- **Verdict: draw in our implementation.** Neither mode dominates; graph wins terms on 8B, vector wins sources everywhere. The binding constraint is no longer model size: extraction JSON validity is 0 errors/52. Next levers are entity resolution (Search Microservice vs search-service split nodes), schema coverage (Kafka typed SERVICE not QUEUE; PUBLISHES_TO/AUTHENTICATES_VIA never emitted) and sub-retriever text recall.
+- **Default stays `retrieve_mode="vector"`.** Graph branch remains useful as an explicit mode + a live target for the resolution/schema work.

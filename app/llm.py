@@ -17,7 +17,9 @@ SYSTEM_INSTRUCTION = (
 
 @lru_cache
 def get_chat_model(
-    temperature: float = 0.2, system_prompt: str | None = None
+    temperature: float = 0.2,
+    system_prompt: str | None = None,
+    max_tokens: int | None = None,
 ) -> OpenAILike:
     """
     Shared OpenAILike client for every LLM call in the project.
@@ -41,7 +43,8 @@ def get_chat_model(
         api_base=settings.LLM_API_BASE,
         api_key=settings.LLM_API_KEY,
         temperature=temperature,
-        timeout=60.0,
+        max_tokens=max_tokens,
+        timeout=300.0,
         max_retries=1,
         is_chat_model=True,
         system_prompt=system_prompt,

@@ -85,17 +85,17 @@ def build_kg_extractors() -> list:
     edges and any schema-valid triplet both land in the graph."""
     return [
         SchemaLLMPathExtractor(
-            llm=get_chat_model(temperature=0.1),
+            llm=get_chat_model(temperature=0.0, max_tokens=1024),
             possible_entities=ENTITIES,
             possible_relations=RELATIONS,
             kg_validation_schema=VALIDATION,
-            # llama.cpp serves 4 slots over a shared 8192 ctx (~2048/slot); the
-            # schema prompt is ~1k tokens, so unbounded 10-triplet JSON answers
-            # with 500 "Context size has been exceeded". 4 triplets ≈ 500 tokens.
+            # 4 triplets ≈ 500 output tokens, inside the extractor's 512 cap.
             max_triplets_per_chunk=4,
             strict=True,
             allow_additional_properties=False,
-            raise_on_error=True,
+            # 1.5B sometimes emits truncated/invalid JSON (observed: EOF while
+            # parsing object); one bad chunk must not abort the whole sync.
+            raise_on_error=False,
         ),
         ImplicitPathExtractor(),
     ]
@@ -183,6 +183,10 @@ async def sync_graph_from_postgres() -> dict[str, int]:
                 "chunk_index": row.chunk_index,
             },
             excluded_embed_metadata_keys=list(METADATA_KEYS),
+            # SchemaLLMPathExtractor reads text via MetadataMode.LLM; without
+            # this the service_id UUID and doc_file_path land in the extraction
+            # prompt and the model extracts them as entities.
+            excluded_llm_metadata_keys=list(METADATA_KEYS),
         )
         for row in rows
     ]

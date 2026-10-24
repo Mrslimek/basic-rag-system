@@ -4,14 +4,15 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from llama_index.core import Document
 from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.node_parser import MarkdownNodeParser
 from llama_index.core.schema import TextNode
 from qdrant_client import AsyncQdrantClient, models
 from sqlalchemy import delete, select
 from taskiq import InMemoryBroker, TaskiqScheduler
 from taskiq.schedule_sources import LabelScheduleSource
 
-from app.chunker import chunk_markdown_paragraphs
 from app.config import get_settings
 from app.database import get_db_context, init_db
 from app.embeddings import get_embedding_model
@@ -99,8 +100,9 @@ async def index_chunks(
 
 async def sync_document_file(file_path: Path) -> bool:
     """
-    Parses a single markdown document, compares hash with database,
-    and updates documentation chunks & embeddings if modified.
+    Splits a single markdown document into sections via MarkdownNodeParser,
+    compares hash with database, and updates documentation chunks &
+    embeddings if modified.
 
     Returns:
         True if updated or inserted, False if skipped because unchanged.
@@ -121,8 +123,18 @@ async def sync_document_file(file_path: Path) -> bool:
 
         logger.info(f"Synchronizing documentation for microservice '{service_name}'...")
 
-        # 1. Chunk document
-        chunks = chunk_markdown_paragraphs(content)
+        # 1. Chunk document into markdown sections with LlamaIndex's
+        # MarkdownNodeParser (pure text parsing, so the sync API is fine).
+        # Verified against the parser source and docs_mock files: each node's
+        # text STARTS with its own heading line ("## Endpoints") followed by
+        # the section body, so heading and content stay together in stored
+        # text with no prepending needed. The metadata key "header_path" holds
+        # only the ANCESTOR headers (ex "/Overview/"), kept on the node for
+        # retrieval-time context, not stored in the chunk row.
+        nodes = MarkdownNodeParser.from_defaults().get_nodes_from_documents(
+            [Document(text=content)]
+        )
+        chunks = [node.text for node in nodes if node.text.strip()]
         if not chunks:
             logger.warning(f"No valid markdown chunks extracted from {file_path}")
             return False
@@ -161,11 +173,11 @@ async def sync_document_file(file_path: Path) -> bool:
         # 3. Insert chunk rows (pure text in Postgres). Graph extraction happens
         # in app/graph_rag's LlamaIndex pipeline against Neo4j, not here.
         chunk_rows: list[ServiceDocumentationChunk] = []
-        for chunk_data in chunks:
+        for chunk_index, chunk_text in enumerate(chunks):
             chunk_row = ServiceDocumentationChunk(
                 service_id=service_record.id,
-                chunk_index=chunk_data.index,
-                content=chunk_data.content,
+                chunk_index=chunk_index,
+                content=chunk_text,
             )
             session.add(chunk_row)
             chunk_rows.append(chunk_row)

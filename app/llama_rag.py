@@ -40,6 +40,8 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, MetadataInfo, VectorStoreInfo
 from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.core.response_synthesizers import ResponseMode
+from llama_index.core.base.base_query_engine import BaseQueryEngine
 from qdrant_client import AsyncQdrantClient, QdrantClient, models as qm
 from sqlalchemy import select
 
@@ -223,7 +225,7 @@ def build_query_engine(
     service_filter: str | None = None,
     collection_name: str | None = None,
     retrieve_mode: Literal["vector", "graph"] = "vector",
-):
+) -> RetrieverQueryEngine | BaseQueryEngine:
     """RetrieverQueryEngine: compact synthesis puts several small chunks into one prompt.
 
     vector: Qdrant-backed index (service_filter and collection_name apply).
@@ -239,7 +241,7 @@ def build_query_engine(
         return RetrieverQueryEngine.from_args(
             retriever=graph_rag.build_graph_retriever(top_k=top_k),
             llm=build_llm(),
-            response_mode="compact",
+            response_mode=ResponseMode.COMPACT,
         )
     index = build_index(collection_name)
     filters = (
