@@ -18,10 +18,12 @@ flowchart LR
     API --> RAG["app/llama_rag.py\none LlamaIndex flow"]
     RAG -->|"retrieve_mode = vector"| QD
     RAG -->|"retrieve_mode = graph"| NEO
+    RAG -->|"retrieve_mode = hybrid\n(vector-first)"| QD
+    RAG -->|"retrieve_mode = hybrid\n(graph facts)"| NEO
     RAG --> LLM["LLM synthesis\n(Ollama / OpenAI-compatible)"]
 ```
 
-1. **One LlamaIndex flow, two retrievals**: `/chat` takes `retrieve_mode: "vector" | "graph"`. Vector mode queries the Qdrant `doc_chunks` collection; graph mode queries a LlamaIndex `PropertyGraphIndex` over Neo4j. Both branches share the same response synthesizer and LLM client, so switching retrieval strategies never changes how answers are composed. The mode selection lives entirely in `app/llama_rag.py`; nothing else knows which branch ran.
+1. **One LlamaIndex flow, three retrieval modes**: `/chat` takes `retrieve_mode: "vector" | "graph" | "hybrid"`. Vector mode queries the Qdrant `doc_chunks` collection; graph mode queries a LlamaIndex `PropertyGraphIndex` over Neo4j. All three branches share the same response synthesizer and LLM client, so switching retrieval strategies never changes how answers are composed. Hybrid mode retrieves the same Qdrant chunks as vector mode and appends a `Graph facts` block — the mentioned entities and their `X -> REL -> Y` semantic triplets from Neo4j — to each chunk's context text. The mode selection lives entirely in `app/llama_rag.py`; nothing else knows which branch ran.
 2. **Postgres is the source of truth for chunk text**: the worker persists every document and its chunks in PostgreSQL first. Qdrant and Neo4j are derived stores that can always be rebuilt from Postgres.
 3. **Asymmetric E5 retrieval**:
    - Stored document chunks are prefixed with `"passage: "`.
@@ -50,7 +52,7 @@ uv run python -m app.graph_rag sync → read chunks from PostgreSQL → LLM extr
 **Query — per request:**
 
 ```
-Streamlit sidebar (vector | graph) → POST /chat { retrieve_mode } → LlamaIndex retriever (Qdrant or Neo4j) → shared LLM synthesis → answer + sources
+Streamlit sidebar (vector | graph | hybrid) → POST /chat { retrieve_mode } → LlamaIndex retriever (Qdrant, Neo4j, or both) → shared LLM synthesis → answer + sources
 ```
 
 ---

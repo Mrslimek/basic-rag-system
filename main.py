@@ -53,9 +53,9 @@ class ChatRequest(BaseModel):
         None, description="Optional microservice name to narrow vector search (e.g., 'billing')"
     )
     top_k: int = Field(default=3, ge=1, le=10, description="Number of context passages to retrieve")
-    retrieve_mode: Literal["vector", "graph"] = Field(
+    retrieve_mode: Literal["vector", "graph", "hybrid"] = Field(
         default="vector",
-        description="RAG branch: 'vector' = Qdrant semantic search, 'graph' = LlamaIndex PropertyGraphIndex over Neo4j",
+        description="RAG branch: 'vector' = Qdrant semantic search, 'graph' = LlamaIndex PropertyGraphIndex over Neo4j, 'hybrid' = vector chunks with Neo4j graph facts appended to their context",
     )
 
 

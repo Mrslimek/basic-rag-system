@@ -26,11 +26,11 @@ with st.sidebar:
     top_k = st.slider("Passages to retrieve (top_k)", min_value=1, max_value=10, value=3)
     rag_mode = st.radio(
         "RAG mode",
-        options=["vector", "graph"],
+        options=["vector", "graph", "hybrid"],
         index=0,
-        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval via LlamaIndex PropertyGraphIndex (Neo4j)",
+        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval via LlamaIndex PropertyGraphIndex (Neo4j); hybrid = vector chunks with Neo4j graph facts appended to the context",
     )
-    st.caption("vector finds passages by embedding similarity; graph follows relationships in the knowledge graph.")
+    st.caption("vector finds passages by embedding similarity; graph follows relationships in the knowledge graph; hybrid combines both (vector-first, graph facts appended).")
 
 # Initialize chat history in Streamlit session state
 if "messages" not in st.session_state:
