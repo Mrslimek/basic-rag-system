@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = "ollama"
     LLM_MODEL: str = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
 
+    # Output token budget for graph triplet extraction (SchemaLLMPathExtractor)
+    extract_max_tokens: int = 2048
+
     # Backend API URL for Streamlit frontend
     BACKEND_API_URL: str = "http://localhost:8000"
 

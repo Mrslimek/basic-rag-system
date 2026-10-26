@@ -26,12 +26,19 @@ Run the graph rebuild after corpus changes (mass LLM calls):
 """
 import asyncio
 import logging
+import re
 import sys
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Sequence
 
 from llama_index.core.base.base_retriever import BaseRetriever
-from llama_index.core.graph_stores.types import EntityNode, Triplet
+from llama_index.core.graph_stores.types import (
+    KG_NODES_KEY,
+    KG_RELATIONS_KEY,
+    EntityNode,
+    Relation,
+    Triplet,
+)
 from llama_index.core.indices.property_graph import (
     ImplicitPathExtractor,
     LLMSynonymRetriever,
@@ -39,7 +46,14 @@ from llama_index.core.indices.property_graph import (
     SchemaLLMPathExtractor,
     VectorContextRetriever,
 )
-from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode
+from llama_index.core.prompts import PromptTemplate
+from llama_index.core.schema import (
+    BaseNode,
+    NodeWithScore,
+    QueryBundle,
+    TextNode,
+    TransformComponent,
+)
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from sqlalchemy import select
@@ -56,18 +70,104 @@ settings = get_settings()
 
 # Uppercase literals — see module docstring, this is a hard extractor constraint.
 ENTITIES = Literal["SERVICE", "ENDPOINT", "DATABASE", "QUEUE", "PROTOCOL", "CONCEPT"]
-RELATIONS = Literal["CALLS", "AUTHENTICATES_VIA", "STORES_IN", "PUBLISHES_TO", "USES", "PROVIDES"]
+RELATIONS = Literal[
+    "USES",
+    "PROVIDES",
+    "PUBLISHES_TO",
+    "SUBSCRIBES_TO",
+    "CALLS",
+    "STORES_IN",
+    "AUTHENTICATES_VIA",
+]
 VALIDATION = [
     ("SERVICE", "PROVIDES", "ENDPOINT"),
     ("SERVICE", "CALLS", "SERVICE"),
     ("SERVICE", "STORES_IN", "DATABASE"),
     ("SERVICE", "PUBLISHES_TO", "QUEUE"),
+    ("SERVICE", "SUBSCRIBES_TO", "QUEUE"),
     ("SERVICE", "USES", "PROTOCOL"),
     ("SERVICE", "USES", "SERVICE"),
     ("SERVICE", "USES", "ENDPOINT"),
+    ("SERVICE", "AUTHENTICATES_VIA", "SERVICE"),
     ("SERVICE", "AUTHENTICATES_VIA", "PROTOCOL"),
     ("ENDPOINT", "USES", "PROTOCOL"),
 ]
+
+# Must keep the extractor's {text}/{max_triplets_per_chunk} placeholders: they
+# are the only variables _aextract passes to astructured_predict.
+EXTRACT_PROMPT_TMPL = (
+    "Extract the knowledge graph from the text below following the schema. "
+    "Kafka topics are QUEUE entities: the producer service PUBLISHES_TO a "
+    "topic and the consuming service SUBSCRIBES_TO it. Data stores (PostgreSQL "
+    "clusters, Redis instances) are DATABASE entities; services connect to "
+    "them with STORES_IN. JWT scopes: a service requiring a scope from "
+    "AuthService links to AuthService with AUTHENTICATES_VIA; never model "
+    "scopes as QUEUE entities. Create QUEUE entities only for topic names "
+    "that contain dots (e.g. service.event.action). USES covers general "
+    "dependencies or reading another service's data. CALLS is a synchronous "
+    "call from one service to another. PROVIDES means a service exposes an "
+    "API specification (ENDPOINT entity). Do not invent facts that are not in "
+    "the text. Limit the output to {max_triplets_per_chunk} paths.\n"
+    "-------\n"
+    "{text}\n"
+    "-------\n"
+)
+
+
+def normalize_entity_name(name: str) -> str:
+    # Dotted names are Kafka topic identifiers: keep their internal punctuation
+    # verbatim, only strip and lowercase.
+    if "." in name:
+        return name.strip().lower()
+    split_camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
+    return re.sub(r"[-_\s]+", " ", split_camel).strip().lower()
+
+
+class CanonicalizingKGExtractor(TransformComponent):
+    # Wraps a KG extractor and rewrites entity names (plus the relation
+    # endpoints that reference them) through normalize_entity_name after each
+    # pass, so name-spelling aliases collapse into one node id at the store.
+    def __init__(self, extractor: TransformComponent) -> None:
+        super().__init__()
+        self._extractor = extractor
+
+    def __call__(
+        self, nodes: Sequence[BaseNode], show_progress: bool = False, **kwargs: Any
+    ) -> list[BaseNode]:
+        extracted = self._extractor(nodes, show_progress=show_progress, **kwargs)
+        return self._canonicalize(extracted)
+
+    async def acall(
+        self, nodes: Sequence[BaseNode], show_progress: bool = False, **kwargs: Any
+    ) -> list[BaseNode]:
+        extracted = await self._extractor.acall(
+            nodes, show_progress=show_progress, **kwargs
+        )
+        return self._canonicalize(extracted)
+
+    @staticmethod
+    def _canonicalize(nodes: Sequence[BaseNode]) -> list[BaseNode]:
+        # EntityNode.id is derived from its name, and Relation.source_id/
+        # target_id store those ids verbatim (not node references), so names
+        # and endpoints must be rewritten together to stay consistent.
+        for node in nodes:
+            entities = node.metadata.get(KG_NODES_KEY) or []
+            relations = node.metadata.get(KG_RELATIONS_KEY) or []
+            name_by_old_id: dict[str, str] = {}
+            for entity in entities:
+                if not isinstance(entity, EntityNode):
+                    continue
+                old_id = entity.id
+                entity.name = normalize_entity_name(entity.name)
+                name_by_old_id[old_id] = entity.id
+            for relation in relations:
+                relation.source_id = name_by_old_id.get(
+                    relation.source_id, relation.source_id
+                )
+                relation.target_id = name_by_old_id.get(
+                    relation.target_id, relation.target_id
+                )
+        return list(nodes)
 
 
 _graph_store: Neo4jPropertyGraphStore | None = None
@@ -91,18 +191,22 @@ def build_kg_extractors() -> list:
     """Schema-constrained LLM extractor + the free-form implicit one, so MENTIONS
     edges and any schema-valid triplet both land in the graph."""
     return [
-        SchemaLLMPathExtractor(
-            llm=get_chat_model(temperature=0.0, max_tokens=1024),
-            possible_entities=ENTITIES,
-            possible_relations=RELATIONS,
-            kg_validation_schema=VALIDATION,
-            # 4 triplets ≈ 500 output tokens, inside the extractor's 512 cap.
-            max_triplets_per_chunk=4,
-            strict=True,
-            allow_additional_properties=False,
-            # 1.5B sometimes emits truncated/invalid JSON (observed: EOF while
-            # parsing object); one bad chunk must not abort the whole sync.
-            raise_on_error=False,
+        CanonicalizingKGExtractor(
+            SchemaLLMPathExtractor(
+                llm=get_chat_model(
+                    temperature=0.0, max_tokens=settings.extract_max_tokens
+                ),
+                extract_prompt=PromptTemplate(EXTRACT_PROMPT_TMPL),
+                possible_entities=ENTITIES,
+                possible_relations=RELATIONS,
+                kg_validation_schema=VALIDATION,
+                max_triplets_per_chunk=8,
+                strict=True,
+                allow_additional_properties=False,
+                # 1.5B sometimes emits truncated/invalid JSON (observed: EOF while
+                # parsing object); one bad chunk must not abort the whole sync.
+                raise_on_error=False,
+            )
         ),
         ImplicitPathExtractor(),
     ]

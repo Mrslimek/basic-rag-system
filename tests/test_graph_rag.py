@@ -1,12 +1,28 @@
 import uuid
+from typing import get_args
 
 import pytest
+from llama_index.core.graph_stores.types import (
+    KG_NODES_KEY,
+    KG_RELATIONS_KEY,
+    EntityNode,
+    Relation,
+)
 from llama_index.core.indices.property_graph import ImplicitPathExtractor, PropertyGraphIndex
 from llama_index.core.schema import TextNode
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 
 from app.config import get_settings
 from app.embeddings import get_embedding_model
+from app.graph_rag import (
+    CanonicalizingKGExtractor,
+    ENTITIES,
+    EXTRACT_PROMPT_TMPL,
+    RELATIONS,
+    VALIDATION,
+    build_kg_extractors,
+    normalize_entity_name,
+)
 from app.llama_rag import METADATA_KEYS
 
 
@@ -113,3 +129,123 @@ def test_graph_rag_module_exposes_retriever_builder():
     """Kept green before the feature lands: app/graph_rag is optional here."""
     graph_rag = pytest.importorskip("app.graph_rag")
     assert callable(graph_rag.build_graph_retriever)
+
+
+def test_normalize_entity_name_variants_collapse():
+    assert normalize_entity_name("Payment Gateway") == "payment gateway"
+    assert normalize_entity_name("payment gateway") == "payment gateway"
+    assert normalize_entity_name("Payment-Gateway") == "payment gateway"
+    assert normalize_entity_name("payment_gateway") == "payment gateway"
+    assert normalize_entity_name("PAYMENT  GATEWAY") == "payment gateway"
+
+
+def test_normalize_entity_name_hyphens_and_underscores():
+    assert normalize_entity_name("Payment Gateway Service") == "payment gateway service"
+    assert normalize_entity_name("payment-gateway-service") == "payment gateway service"
+    assert normalize_entity_name("payment_gateway_service") == "payment gateway service"
+    assert normalize_entity_name("  payment--gateway_ service\n") == "payment gateway service"
+
+
+def test_normalize_entity_name_splits_camel_case():
+    assert normalize_entity_name("PaymentGatewayService") == "payment gateway service"
+    assert normalize_entity_name("AuthService") == "auth service"
+    assert normalize_entity_name("PaymentsServiceStream") == "payments service stream"
+    assert normalize_entity_name("UserPreferencesService") == "user preferences service"
+    # CamelCase with hyphens: both rules apply, old cases stay green.
+    assert normalize_entity_name("Payment-GatewayService") == "payment gateway service"
+
+
+def test_normalize_entity_name_keeps_topic_names_verbatim():
+    # Dotted names are topic identifiers: only strip + lowercase, no
+    # underscore collapsing and no camelCase splitting.
+    assert (
+        normalize_entity_name("billing.invoice.payment_failed")
+        == "billing.invoice.payment_failed"
+    )
+    assert normalize_entity_name("analytics.live.metrics") == "analytics.live.metrics"
+    assert normalize_entity_name("  orders.created.v1 ") == "orders.created.v1"
+    # Dot present => topic branch, camelCase is NOT split.
+    assert normalize_entity_name("PaymentGateWay.Service") == "paymentgateway.service"
+
+
+def test_extraction_schema_has_subscribes_to_and_authenticates_via():
+    relations = set(get_args(RELATIONS))
+    assert {
+        "USES",
+        "PROVIDES",
+        "PUBLISHES_TO",
+        "SUBSCRIBES_TO",
+        "CALLS",
+        "STORES_IN",
+        "AUTHENTICATES_VIA",
+    } <= relations
+    assert "QUEUE" in set(get_args(ENTITIES))
+    assert ("SERVICE", "SUBSCRIBES_TO", "QUEUE") in VALIDATION
+    assert ("SERVICE", "AUTHENTICATES_VIA", "SERVICE") in VALIDATION
+
+
+class _StubKGExtractor:
+    def __call__(self, nodes, show_progress=False, **kwargs):
+        source = EntityNode(name="PaymentGatewayService", label="SERVICE")
+        target = EntityNode(name="payment-gateway-service", label="SERVICE")
+        relation = Relation(label="CALLS", source_id=source.id, target_id=target.id)
+        for node in nodes:
+            node.metadata[KG_NODES_KEY] = [source, target]
+            node.metadata[KG_RELATIONS_KEY] = [relation]
+        return nodes
+
+    async def acall(self, nodes, show_progress=False, **kwargs):
+        return self(nodes, show_progress=show_progress, **kwargs)
+
+
+def test_canonicalizing_extractor_normalizes_entities_and_endpoints():
+    wrapper = CanonicalizingKGExtractor(_StubKGExtractor())
+    chunk = TextNode(id_="chunk-1", text="Billing calls the payment gateway.")
+    processed = wrapper([chunk])
+
+    entities = processed[0].metadata[KG_NODES_KEY]
+    relations = processed[0].metadata[KG_RELATIONS_KEY]
+    assert {entity.name for entity in entities} == {"payment gateway service"}
+    assert all(entity.id == "payment gateway service" for entity in entities)
+    assert relations[0].source_id == "payment gateway service"
+    assert relations[0].target_id == "payment gateway service"
+
+
+async def test_canonicalizing_extractor_acall_normalizes_entities_and_endpoints():
+    wrapper = CanonicalizingKGExtractor(_StubKGExtractor())
+    chunk = TextNode(id_="chunk-2", text="Billing calls the payment gateway.")
+    processed = await wrapper.acall([chunk])
+
+    entities = processed[0].metadata[KG_NODES_KEY]
+    relations = processed[0].metadata[KG_RELATIONS_KEY]
+    assert {entity.name for entity in entities} == {"payment gateway service"}
+    assert all(entity.id == "payment gateway service" for entity in entities)
+    assert relations[0].source_id == "payment gateway service"
+    assert relations[0].target_id == "payment gateway service"
+
+
+def test_extractor_llm_uses_settings_extract_max_tokens():
+    extractors = build_kg_extractors()
+    canonicalizing, implicit = extractors[0], extractors[1]
+    assert isinstance(canonicalizing, CanonicalizingKGExtractor)
+    assert isinstance(implicit, ImplicitPathExtractor)
+    assert canonicalizing._extractor.llm.max_tokens == get_settings().extract_max_tokens
+    assert canonicalizing._extractor.max_triplets_per_chunk == 8
+
+
+def test_extract_prompt_defines_all_seven_relations():
+    assert "{text}" in EXTRACT_PROMPT_TMPL
+    assert "{max_triplets_per_chunk}" in EXTRACT_PROMPT_TMPL
+    for relation in (
+        "USES",
+        "CALLS",
+        "PROVIDES",
+        "PUBLISHES_TO",
+        "SUBSCRIBES_TO",
+        "STORES_IN",
+        "AUTHENTICATES_VIA",
+    ):
+        assert relation in EXTRACT_PROMPT_TMPL
+    assert "never model scopes as QUEUE" in EXTRACT_PROMPT_TMPL
+    assert "contain dots" in EXTRACT_PROMPT_TMPL
+    assert "not invent facts" in EXTRACT_PROMPT_TMPL.lower()
