@@ -64,6 +64,7 @@ Streamlit sidebar (vector | graph | hybrid) → POST /chat { retrieve_mode } →
 - **[uv](https://docs.astral.sh/uv/)** package manager
 - **Docker** (for PostgreSQL, Qdrant, and Neo4j via docker-compose)
 - *(Optional)* **llama.cpp** running locally serving `Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF` at `http://127.0.0.1:8080/v1` (API key `ollama`), or any OpenAI-compatible API. Graph sync and answer synthesis both call the LLM, so one must be reachable for those steps.
+Copy `.env.example` to `.env` and fill in `LLM_API_KEY` when using an external OpenAI-compatible provider; `.env` is gitignored, so secrets never enter commits.
 
 ---
 
@@ -131,3 +132,16 @@ Vector search works as soon as the worker has indexed the docs. The graph branch
 uv run python -m app.graph_rag sync
 ```
 Re-run it whenever documentation changes materially; it wipes and rebuilds the graph in place.
+
+---
+
+### 6. Backing up and restoring Neo4j
+
+Backing up the extracted graph protects it from an accidental wipe: a backup can always be restored without re-running the expensive LLM extraction sync. The Neo4j container is stopped for a few seconds during either operation and restarted automatically (PostgreSQL and Qdrant stay up):
+
+```bash
+./scripts/neo4j_backup.sh save
+./scripts/neo4j_backup.sh restore backups/neo4j_<timestamp>.tar.gz
+```
+
+`save` archives the Neo4j `/data` directory to a timestamped compressed file in `backups/`; `restore` deletes the current graph data and extracts the archive in its place.

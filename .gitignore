@@ -12,5 +12,8 @@ venv/
 .mypy_cache/
 .coverage
 
+# Neo4j backups (large binary archives, written by scripts/neo4j_backup.sh)
+backups/
+
 # OS
 .DS_Store
