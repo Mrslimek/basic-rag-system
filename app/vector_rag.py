@@ -29,7 +29,8 @@ from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.schema import TextNode
 from llama_index.core.vector_stores import MetadataInfo, VectorStoreInfo
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-from qdrant_client import AsyncQdrantClient, QdrantClient, models as qm
+from qdrant_client import AsyncQdrantClient, QdrantClient
+from qdrant_client import models as qm
 from sqlalchemy import select
 
 from app.config import get_settings
@@ -109,7 +110,7 @@ def build_vector_store(collection_name: str | None = None) -> QdrantVectorStore:
             ],
             content_info="Markdown chunk of a microservice specification (endpoints, payloads, behavior)",
         ),
-        payload_indexes=[{"field_name": FILTER_SERVICE_KEY, "field_schema": qm.PayloadSchemaType.KEYWORD}],
+        payload_indexes=[{"field_name": FILTER_SERVICE_KEY, "field_schema": qm.PayloadSchemaType.KEYWORD}],  # ty: ignore[invalid-argument-type] llama-index stub types every payload_indexes value as PayloadSchemaType; real entries mix str field_name with enum field_schema
     )
 
 

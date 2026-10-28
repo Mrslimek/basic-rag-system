@@ -6,9 +6,9 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from app import query, vector_rag
 from app.config import get_settings
 from app.database import init_db
-from app import query, vector_rag
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rag_api")
@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         logger.info("Database schemas initialized successfully.")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - startup must continue when Postgres is unreachable
         logger.warning(
             f"Could not connect to PostgreSQL on startup ({e}). "
             "Ensure PostgreSQL is running before invoking RAG queries."
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
         # ensure_collection is blocking sync I/O; keep it off the event loop.
         await asyncio.to_thread(vector_rag.ensure_collection, settings.QDRANT_COLLECTION)
         logger.info("Qdrant collection is ready.")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - startup must continue when Qdrant is unreachable
         logger.warning(
             f"Could not reach Qdrant on startup ({e}). "
             "Run `docker compose up -d qdrant` before invoking RAG queries."
@@ -88,8 +88,8 @@ async def chat_endpoint(request: ChatRequest):
             retrieve_mode=request.retrieve_mode,
         )
     except Exception as e:
-        logger.error(f"Error during LlamaIndex query: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"LlamaIndex retrieval error: {str(e)}")
+        logger.exception("Error during LlamaIndex query")
+        raise HTTPException(status_code=500, detail=f"LlamaIndex retrieval error: {e!s}")
 
     sources = [
         SourceReference(

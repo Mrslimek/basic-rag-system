@@ -1,5 +1,6 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 from sqlalchemy import (
     DateTime,
     ForeignKey,
@@ -31,12 +32,12 @@ class Service(Base):
     doc_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
         nullable=False,
     )
 
     # 1-to-many relationship with documentation chunks
-    chunks: Mapped[list["ServiceDocumentationChunk"]] = relationship(
+    chunks: Mapped[list[ServiceDocumentationChunk]] = relationship(
         "ServiceDocumentationChunk",
         back_populates="service",
         cascade="all, delete-orphan",
@@ -68,9 +69,9 @@ class ServiceDocumentationChunk(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
         nullable=False,
     )
 
     # Relationship back to service parent entity for provenance tracking
-    service: Mapped["Service"] = relationship("Service", back_populates="chunks")
+    service: Mapped[Service] = relationship("Service", back_populates="chunks")

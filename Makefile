@@ -1,4 +1,4 @@
-.PHONY: help up down ps env worker sync vector-sync backend frontend test backup restore
+.PHONY: help up down ps env worker sync vector-sync backend frontend test lint typecheck backup restore
 
 help: ## List all available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':[^#]*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -32,6 +32,12 @@ frontend: ## Run the Streamlit chat UI on port 8501
 
 test: up ## Run the test suite (starts infrastructure first)
 	uv run --extra dev pytest
+
+lint: ## Run the ruff linter
+	uv run --extra dev ruff check .
+
+typecheck: ## Run the ty type checker
+	uv run --extra dev ty check
 
 backup: ## Save the Neo4j graph to backups/
 	./scripts/neo4j_backup.sh save

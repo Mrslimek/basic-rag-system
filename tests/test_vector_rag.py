@@ -66,7 +66,11 @@ async def test_llama_ingestion_retrieval_and_metadata_filter():
         assert hits
         assert hits[0].node.metadata["service_name"] == f"billing-{suffix}"
         # Score is cosine on our shared e5 vectors -> comparable to the hand-written path.
-        assert hits[0].score > hits[-1].score or len(hits) == 1
+        top_score = hits[0].score
+        last_score = hits[-1].score
+        assert len(hits) == 1 or (
+            top_score is not None and last_score is not None and top_score > last_score
+        )
 
         filtered = index.as_retriever(
             similarity_top_k=2,

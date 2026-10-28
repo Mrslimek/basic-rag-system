@@ -53,3 +53,9 @@ testpaths = ["tests"]
 [tool.uv.workspace]
 members = []
 
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+    "ty>=0.0.93",
+]
+

@@ -25,14 +25,14 @@ import asyncio
 import logging
 import re
 import sys
-from typing import Any, Literal, Sequence
+from collections.abc import Sequence
+from typing import Any, Literal
 
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.graph_stores.types import (
     KG_NODES_KEY,
     KG_RELATIONS_KEY,
     EntityNode,
-    Relation,
 )
 from llama_index.core.indices.property_graph import (
     ImplicitPathExtractor,
@@ -189,8 +189,8 @@ def build_kg_extractors() -> list:
                     temperature=0.0, max_tokens=settings.extract_max_tokens
                 ),
                 extract_prompt=PromptTemplate(EXTRACT_PROMPT_TMPL),
-                possible_entities=ENTITIES,
-                possible_relations=RELATIONS,
+                possible_entities=ENTITIES,  # ty: ignore[invalid-argument-type] llama-index stub says type[Any], runtime uses get_args() which needs the Literal
+                possible_relations=RELATIONS,  # ty: ignore[invalid-argument-type] llama-index stub says type[Any], runtime uses get_args() which needs the Literal
                 kg_validation_schema=VALIDATION,
                 max_triplets_per_chunk=8,
                 strict=True,

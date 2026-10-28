@@ -1,25 +1,29 @@
 import uuid
-from typing import get_args
+from typing import cast, get_args
 
 import pytest
 from llama_index.core.graph_stores.types import (
     KG_NODES_KEY,
     KG_RELATIONS_KEY,
+    ChunkNode,
     EntityNode,
     Relation,
 )
-from llama_index.core.indices.property_graph import ImplicitPathExtractor, PropertyGraphIndex
-from llama_index.core.schema import TextNode
+from llama_index.core.indices.property_graph import (
+    ImplicitPathExtractor,
+    PropertyGraphIndex,
+)
+from llama_index.core.schema import TextNode, TransformComponent
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 
 from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.graph_rag import (
-    CanonicalizingKGExtractor,
     ENTITIES,
     EXTRACT_PROMPT_TMPL,
     RELATIONS,
     VALIDATION,
+    CanonicalizingKGExtractor,
     build_kg_extractors,
     normalize_entity_name,
 )
@@ -101,7 +105,9 @@ async def test_graph_store_roundtrip_without_llm():
         await index.ainsert_nodes([node1, node2])
 
         # Raw store roundtrip (sync driver): ChunkNode text + flat properties.
-        fetched = {chunk.id: chunk for chunk in store.get(ids=ids)}
+        # The neo4j store builds ChunkNode objects (text + properties) but its stub
+        # widens get() to LabelledNode, which has no .text.
+        fetched = {chunk.id: cast(ChunkNode, chunk) for chunk in store.get(ids=ids)}
         assert set(fetched) == set(ids)
         assert fetched[node1.id_].text == node1.get_content()
         assert fetched[node2.id_].text == node2.get_content()
@@ -184,7 +190,7 @@ def test_extraction_schema_has_subscribes_to_and_authenticates_via():
     assert ("SERVICE", "AUTHENTICATES_VIA", "SERVICE") in VALIDATION
 
 
-class _StubKGExtractor:
+class _StubKGExtractor(TransformComponent):
     def __call__(self, nodes, show_progress=False, **kwargs):
         source = EntityNode(name="PaymentGatewayService", label="SERVICE")
         target = EntityNode(name="payment-gateway-service", label="SERVICE")

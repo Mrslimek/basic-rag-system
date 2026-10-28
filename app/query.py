@@ -19,7 +19,7 @@ vector-vs-graph A/B never leaves this module.
 """
 import logging
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 from llama_index.core.base.base_query_engine import BaseQueryEngine
 from llama_index.core.llms import LLM
@@ -159,9 +159,12 @@ async def aquery(
         response = await engine.aquery(question)
         sources = _nodes_to_results(list(response.source_nodes))
         return str(response), sources
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any synthesis failure must fall back to raw retrieved context
         logger.info(f"LlamaIndex LLM call failed ({exc}); falling back to retrieved context.")
-        nodes = await engine.retriever.aretrieve(question)
+        # All three branches return RetrieverQueryEngine; the union in the
+        # build_query_engine signature exists only because as_query_engine's
+        # stub returns the BaseQueryEngine it wraps.
+        nodes = await cast(RetrieverQueryEngine, engine).retriever.aretrieve(question)
         sources = _nodes_to_results(list(nodes))
         context = build_context(sources)
         reply = (

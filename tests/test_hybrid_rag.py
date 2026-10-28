@@ -1,16 +1,19 @@
 import logging
 import uuid
-from typing import get_args
+from typing import cast, get_args
 
 import pytest
 from llama_index.core.graph_stores.types import Relation
-from llama_index.core.indices.property_graph import ImplicitPathExtractor, PropertyGraphIndex
+from llama_index.core.indices.property_graph import (
+    ImplicitPathExtractor,
+    PropertyGraphIndex,
+)
 from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.schema import TextNode
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 
-from app import graph_rag
-from app import hybrid_rag
+from app import graph_rag, hybrid_rag
 from app.config import get_settings
 from app.embeddings import get_embedding_model
 from app.vector_rag import (
@@ -243,7 +246,9 @@ def test_hybrid_wiring_build_query_engine_and_chat_request(monkeypatch):
 
     monkeypatch.setattr(graph_rag, "get_graph_store", _no_graph)
     engine = build_query_engine(top_k=2, retrieve_mode="hybrid")
-    assert isinstance(engine.retriever, hybrid_rag._HybridRetriever)
+    # build_query_engine's union return type exists only because as_query_engine
+    # is stubbed as BaseQueryEngine; every branch returns a RetrieverQueryEngine.
+    assert isinstance(cast(RetrieverQueryEngine, engine).retriever, hybrid_rag._HybridRetriever)
 
     assert get_args(ChatRequest.model_fields["retrieve_mode"].annotation) == (
         "vector",

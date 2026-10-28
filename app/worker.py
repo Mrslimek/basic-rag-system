@@ -1,8 +1,9 @@
 import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from llama_index.core import Document
 from llama_index.core.ingestion import IngestionPipeline
@@ -16,8 +17,8 @@ from taskiq.schedule_sources import LabelScheduleSource
 from app.config import get_settings
 from app.database import get_db_context, init_db
 from app.embeddings import get_embedding_model
-from app.vector_rag import METADATA_KEYS, build_vector_store, ensure_collection
 from app.models import Service, ServiceDocumentationChunk
+from app.vector_rag import METADATA_KEYS, build_vector_store, ensure_collection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docs_sync_worker")
@@ -42,7 +43,7 @@ _qdrant_client: AsyncQdrantClient | None = None
 def get_qdrant_client() -> AsyncQdrantClient:
     global _qdrant_client
     if _qdrant_client is None:
-        _qdrant_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30.0)
+        _qdrant_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30)
     return _qdrant_client
 
 
@@ -131,8 +132,13 @@ async def sync_document_file(file_path: Path) -> bool:
         # text with no prepending needed. The metadata key "header_path" holds
         # only the ANCESTOR headers (ex "/Overview/"), kept on the node for
         # retrieval-time context, not stored in the chunk row.
-        nodes = MarkdownNodeParser.from_defaults().get_nodes_from_documents(
-            [Document(text=content)]
+        # MarkdownNodeParser yields TextNode instances; the llama-index stub
+        # widens the return type to BaseNode, which has no .text.
+        nodes = cast(
+            list[TextNode],
+            MarkdownNodeParser.from_defaults().get_nodes_from_documents(
+                [Document(text=content)]
+            ),
         )
         chunks = [node.text for node in nodes if node.text.strip()]
         if not chunks:
@@ -144,7 +150,7 @@ async def sync_document_file(file_path: Path) -> bool:
         if existing_service:
             existing_service.doc_hash = content_hash
             existing_service.doc_file_path = str(file_path)
-            existing_service.last_synced_at = datetime.now(timezone.utc)
+            existing_service.last_synced_at = datetime.now(UTC)
             service_record = existing_service
             # Capture old chunk ids BEFORE deleting: they double as the Qdrant
             # point ids used for orphan cleanup below.
@@ -165,7 +171,7 @@ async def sync_document_file(file_path: Path) -> bool:
                 description=f"Documentation for {service_name} microservice",
                 doc_file_path=str(file_path),
                 doc_hash=content_hash,
-                last_synced_at=datetime.now(timezone.utc),
+                last_synced_at=datetime.now(UTC),
             )
             session.add(service_record)
             await session.flush()  # populate service_record.id
@@ -221,8 +227,8 @@ async def sync_docs_task() -> dict[str, int]:
             was_updated = await sync_document_file(md_file)
             if was_updated:
                 updated_count += 1
-        except Exception as e:
-            logger.error(f"Error processing doc file {md_file}: {e}", exc_info=True)
+        except Exception:
+            logger.exception(f"Error processing doc file {md_file}")
 
     logger.info(f"Sync complete. Scanned {len(markdown_files)} files, updated {updated_count}.")
     return {"scanned": len(markdown_files), "updated": updated_count}

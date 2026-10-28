@@ -86,7 +86,7 @@ class _HybridRetriever(BaseRetriever):
                 [node.node_id for node in nodes],
                 self._top_k,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any Neo4j failure must degrade hybrid to plain vector results
             logger.warning(
                 f"Neo4j unavailable during hybrid expansion ({exc}); "
                 "returning plain vector results."

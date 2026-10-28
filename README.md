@@ -98,6 +98,7 @@ Run the full test suite via `make test` — it starts the infrastructure automat
 ```bash
 make test
 ```
+`make lint` runs ruff, `make typecheck` runs ty — both are part of the dev extras.
 
 ---
 
