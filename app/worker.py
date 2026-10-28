@@ -16,7 +16,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 from app.config import get_settings
 from app.database import get_db_context, init_db
 from app.embeddings import get_embedding_model
-from app.llama_rag import METADATA_KEYS, build_vector_store, ensure_collection
+from app.vector_rag import METADATA_KEYS, build_vector_store, ensure_collection
 from app.models import Service, ServiceDocumentationChunk
 
 logging.basicConfig(level=logging.INFO)

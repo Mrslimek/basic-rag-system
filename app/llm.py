@@ -4,8 +4,8 @@ from llama_index.llms.openai_like import OpenAILike
 
 from app.config import get_settings
 
-# Single source of truth for the answer-policy prompt: the query engine in
-# llama_rag.py gets it as system_prompt, so retrieval and synthesis can never
+# Single source of truth for the answer-policy prompt: query.py builds it as
+# system_prompt, so retrieval and synthesis can never
 # drift apart via diverging prompts.
 SYSTEM_INSTRUCTION = (
     "You are an expert microservices architecture assistant. "

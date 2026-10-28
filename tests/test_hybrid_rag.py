@@ -10,9 +10,10 @@ from llama_index.core.schema import TextNode
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 
 from app import graph_rag
+from app import hybrid_rag
 from app.config import get_settings
 from app.embeddings import get_embedding_model
-from app.llama_rag import (
+from app.vector_rag import (
     METADATA_KEYS,
     build_index,
     build_vector_store,
@@ -25,7 +26,7 @@ _QUERY = "How do recurring payments work?"
 
 def _make_nodes(suffix: str) -> list[TextNode]:
     # Same texts and metadata shape as the seeds in test_graph_rag.py and
-    # test_llama_rag.py, so the same TextNode objects (same uuid ids) can
+    # test_vector_rag.py, so the same TextNode objects (same uuid ids) can
     # drive both the Qdrant and the Neo4j seeding.
     return [
         TextNode(
@@ -170,7 +171,7 @@ async def test_hybrid_appends_graph_facts_and_preserves_vector_stage():
         assert {row["name"] for row in probe} == {f"Billing Service-{suffix}", f"Kafka-{suffix}"}
         assert any("SERVICE" in row["l"] for row in probe)
 
-        retriever = graph_rag.build_hybrid_retriever(top_k=2, collection_name=collection)
+        retriever = hybrid_rag.build_hybrid_retriever(top_k=2, collection_name=collection)
         hits = await retriever.aretrieve(_QUERY)
 
         assert all(h.node.node_id in ids for h in hits)
@@ -213,9 +214,9 @@ async def test_hybrid_degrades_to_vector_results_when_neo4j_down(caplog, monkeyp
                 raise RuntimeError("Neo4j is down (simulated)")
 
         monkeypatch.setattr(graph_rag, "get_graph_store", lambda: _DownStore())
-        caplog.set_level(logging.WARNING, logger="graph_rag")
+        caplog.set_level(logging.WARNING, logger="hybrid_rag")
 
-        retriever = graph_rag.build_hybrid_retriever(top_k=2, collection_name=collection)
+        retriever = hybrid_rag.build_hybrid_retriever(top_k=2, collection_name=collection)
         hits = await retriever.aretrieve(_QUERY)
 
         base = build_index(collection_name=collection).as_retriever(similarity_top_k=2)
@@ -234,7 +235,7 @@ async def test_hybrid_degrades_to_vector_results_when_neo4j_down(caplog, monkeyp
 
 
 def test_hybrid_wiring_build_query_engine_and_chat_request(monkeypatch):
-    from app.llama_rag import build_query_engine
+    from app.query import build_query_engine
     from main import ChatRequest
 
     def _no_graph() -> Neo4jPropertyGraphStore:
@@ -242,7 +243,7 @@ def test_hybrid_wiring_build_query_engine_and_chat_request(monkeypatch):
 
     monkeypatch.setattr(graph_rag, "get_graph_store", _no_graph)
     engine = build_query_engine(top_k=2, retrieve_mode="hybrid")
-    assert isinstance(engine.retriever, graph_rag._HybridRetriever)
+    assert isinstance(engine.retriever, hybrid_rag._HybridRetriever)
 
     assert get_args(ChatRequest.model_fields["retrieve_mode"].annotation) == (
         "vector",

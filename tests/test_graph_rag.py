@@ -23,11 +23,11 @@ from app.graph_rag import (
     build_kg_extractors,
     normalize_entity_name,
 )
-from app.llama_rag import METADATA_KEYS
+from app.vector_rag import METADATA_KEYS
 
 
 def _make_nodes(suffix: str) -> list[TextNode]:
-    # Same shape as the real pipeline chunks (app.llama_rag.sync_from_postgres):
+    # Same shape as the real pipeline chunks (app.vector_rag.sync_from_postgres):
     # uuid ids, METADATA_KEYS provenance, metadata excluded from the embedded text.
     return [
         TextNode(

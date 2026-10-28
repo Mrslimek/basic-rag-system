@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.database import init_db
-from app import llama_rag
+from app import query, vector_rag
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rag_api")
@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
         )
     try:
         # ensure_collection is blocking sync I/O; keep it off the event loop.
-        await asyncio.to_thread(llama_rag.ensure_collection, settings.QDRANT_COLLECTION)
+        await asyncio.to_thread(vector_rag.ensure_collection, settings.QDRANT_COLLECTION)
         logger.info("Qdrant collection is ready.")
     except Exception as e:
         logger.warning(
@@ -81,7 +81,7 @@ async def health():
 async def chat_endpoint(request: ChatRequest):
     """RAG endpoint: LlamaIndex retrieval and LLM synthesis over the Qdrant collection."""
     try:
-        llm_reply, results = await llama_rag.aquery(
+        llm_reply, results = await query.aquery(
             question=request.message,
             top_k=request.top_k,
             service_filter=request.service_filter,

@@ -15,7 +15,7 @@ flowchart LR
     PG -->|"app.graph_rag sync\nLLM relation extraction"| NEO[("Neo4j\nknowledge graph")]
 
     UI["Streamlit UI\n(frontend.py)"] --> API["FastAPI /chat\n(main.py)"]
-    API --> RAG["app/llama_rag.py\none LlamaIndex flow"]
+    API --> RAG["app/query.py\none LlamaIndex flow"]
     RAG -->|"retrieve_mode = vector"| QD
     RAG -->|"retrieve_mode = graph"| NEO
     RAG -->|"retrieve_mode = hybrid\n(vector-first)"| QD
@@ -23,7 +23,7 @@ flowchart LR
     RAG --> LLM["LLM synthesis\n(Ollama / OpenAI-compatible)"]
 ```
 
-1. **One LlamaIndex flow, three retrieval modes**: `/chat` takes `retrieve_mode: "vector" | "graph" | "hybrid"`. Vector mode queries the Qdrant `doc_chunks` collection; graph mode queries a LlamaIndex `PropertyGraphIndex` over Neo4j. All three branches share the same response synthesizer and LLM client, so switching retrieval strategies never changes how answers are composed. Hybrid mode retrieves the same Qdrant chunks as vector mode and appends a `Graph facts` block — the mentioned entities and their `X -> REL -> Y` semantic triplets from Neo4j — to each chunk's context text. The mode selection lives entirely in `app/llama_rag.py`; nothing else knows which branch ran.
+1. **One LlamaIndex flow, three retrieval modes**: `/chat` takes `retrieve_mode: "vector" | "graph" | "hybrid"`. Vector mode queries the Qdrant `doc_chunks` collection; graph mode queries a LlamaIndex `PropertyGraphIndex` over Neo4j. All three branches share the same response synthesizer and LLM client, so switching retrieval strategies never changes how answers are composed. Hybrid mode retrieves the same Qdrant chunks as vector mode and appends a `Graph facts` block — the mentioned entities and their `X -> REL -> Y` semantic triplets from Neo4j — to each chunk's context text. The mode selection lives entirely in `app/query.py`; nothing else knows which branch ran.
 2. **Postgres is the source of truth for chunk text**: the worker persists every document and its chunks in PostgreSQL first. Qdrant and Neo4j are derived stores that can always be rebuilt from Postgres.
 3. **Asymmetric E5 retrieval**:
    - Stored document chunks are prefixed with `"passage: "`.
@@ -32,6 +32,13 @@ flowchart LR
 4. **Deterministic paragraph chunking**: technical markdown specifications contain structured endpoint descriptions and JSON/YAML code examples. Splitting by paragraphs (`\n\n+`) prevents cutting schema bodies or tables midway.
 5. **Taskiq background worker**: a scheduler triggers every 60 seconds, scans `docs_mock/*.md`, computes SHA-256 hashes to detect changes, replaces changed documents' chunks in Postgres atomically, and re-embeds them into Qdrant through the LlamaIndex `IngestionPipeline`.
 6. **The knowledge graph is built separately from the vector index**: a full rebuild is triggered on demand with `uv run python -m app.graph_rag sync`. It reads chunks from Postgres and extracts entities and relationships with an LLM inside the index via LlamaIndex's `SchemaLLMPathExtractor`, writing the result to Neo4j. Retrieval must run against an APOC-enabled Neo4j; `docker-compose.yml` provisions it with `NEO4J_PLUGINS: '["apoc"]'`.
+
+```
+app/vector_rag.py — Qdrant rebuild + vector index/retrieval
+app/graph_rag.py — Neo4j graph build, extraction schema, graph retrieval
+app/hybrid_rag.py — vector-first hybrid with MENTIONS fact expansion
+app/query.py — shared synthesis engine, retrieve_mode dispatch, /chat entry
+```
 
 ---
 
@@ -135,7 +142,7 @@ Vector search works as soon as the worker has indexed the docs. The graph branch
 ```bash
 make sync
 ```
-Re-run it whenever documentation changes materially; it wipes and rebuilds the graph in place.
+Re-run it whenever documentation changes materially; it wipes and rebuilds the graph in place. `make vector-sync` rebuilds the Qdrant index from Postgres the same way, which is usually unnecessary — the worker does it automatically.
 
 ---
 

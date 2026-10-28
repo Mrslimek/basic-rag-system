@@ -1,7 +1,7 @@
 # A/B Results — vector vs graph retrieval (`aquery`, top_k=4)
 
 Wave 3 measurement over the 20 questions in [questions.md](questions.md).
-For each question both branches of `app.llama_rag.aquery(question, top_k=4, retrieve_mode="vector"|"graph")` were run sequentially against the live stack (Neo4j graph: 102 Chunk / 78 Entity; Qdrant `doc_chunks`: 102 points; llama.cpp Qwen2.5-Coder-1.5B).
+For each question both branches of `app.query.aquery(question, top_k=4, retrieve_mode="vector"|"graph")` were run sequentially against the live stack (Neo4j graph: 102 Chunk / 78 Entity; Qdrant `doc_chunks`: 102 points; llama.cpp Qwen2.5-Coder-1.5B).
 
 Metrics per cell (case-insensitive substring grading, see questions.md for expected answers):
 - **sources_hit** — fraction of the question's expected source services present among the retrieved chunks' `service_name` metadata.

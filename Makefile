@@ -1,4 +1,4 @@
-.PHONY: help up down ps env worker sync backend frontend test backup restore
+.PHONY: help up down ps env worker sync vector-sync backend frontend test backup restore
 
 help: ## List all available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':[^#]*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -20,6 +20,9 @@ worker: ## Run the Taskiq docs-ingestion worker
 
 sync: ## Rebuild the Neo4j knowledge graph (needs a reachable LLM)
 	uv run python -m app.graph_rag sync
+
+vector-sync: ## Rebuild the Qdrant vector index from Postgres (worker does this automatically)
+	uv run python -m app.vector_rag sync
 
 backend: ## Run the FastAPI backend with reload on port 8000
 	uv run uvicorn main:app --reload --port 8000

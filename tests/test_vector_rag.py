@@ -5,7 +5,7 @@ from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.schema import TextNode
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
 
-from app.llama_rag import (
+from app.vector_rag import (
     FILTER_SERVICE_KEY,
     METADATA_KEYS,
     build_vector_store,
