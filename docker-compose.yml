@@ -1,6 +1,6 @@
 services:
   db:
-    # Plain PostgreSQL 18: vectors live in Qdrant, Postgres keeps documents + graph JSONB.
+    # Plain PostgreSQL 18: vectors live in Qdrant, Postgres keeps documents + chunks.
     image: postgres:18-alpine
     container_name: rag_docs_db
     restart: unless-stopped

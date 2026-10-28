@@ -12,6 +12,9 @@ venv/
 .mypy_cache/
 .coverage
 
+# ZCode session state
+.zcode/
+
 # Neo4j backups (large binary archives, written by scripts/neo4j_backup.sh)
 backups/
 

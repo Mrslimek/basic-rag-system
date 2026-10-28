@@ -46,7 +46,7 @@ docs_mock/*.md → hash check → paragraph chunks → PostgreSQL → IngestionP
 **Graph rebuild — manual, on demand:**
 
 ```
-uv run python -m app.graph_rag sync → read chunks from PostgreSQL → LLM extraction (SchemaLLMPathExtractor) → Neo4j (full rebuild)
+make sync → read chunks from PostgreSQL → LLM extraction (SchemaLLMPathExtractor) → Neo4j (full rebuild)
 ```
 
 **Query — per request:**
@@ -87,49 +87,53 @@ BACKEND_API_URL=http://localhost:8000
 ---
 
 ### 3. Run Tests
-Verify the pipeline using `pytest` via `uv`:
+Run the full test suite via `make test` — it starts the infrastructure automatically first (`test` depends on `up`, so `docker compose up -d` runs before pytest):
 ```bash
-uv run --extra dev pytest
+make test
 ```
 
 ---
 
 ### 4. Running the Services
 
-#### Option 1: One-Command Startup with Docker Compose (Recommended)
-Start PostgreSQL, Qdrant (v1.20), the APOC-enabled Neo4j 5.26, the Taskiq background worker, the FastAPI backend, and the Streamlit UI with a single command:
-```bash
-docker compose up --build
-```
+All services are started through the Makefile (`make help` lists every target). `docker compose` only provides the infrastructure layer (PostgreSQL, Qdrant, Neo4j); the app processes run locally via `uv`. Workflow order:
+
+1. *(Optional)* **Create the environment file** — copies `.env.example` to `.env` only if `.env` does not exist yet:
+   ```bash
+   make env
+   ```
+2. **Start the infrastructure** (PostgreSQL, Qdrant, Neo4j):
+   ```bash
+   make up
+   ```
+3. **Start the Taskiq worker** (syncs and embeds markdown docs every 60 seconds):
+   ```bash
+   make worker
+   ```
+4. **Build the knowledge graph** (manual, see below; requires a reachable LLM):
+   ```bash
+   make sync
+   ```
+5. **Start the FastAPI backend**:
+   ```bash
+   make backend
+   ```
+6. **Start the Streamlit chat UI** (run in a separate terminal):
+   ```bash
+   make frontend
+   ```
+
 - **Streamlit Chat UI**: [http://localhost:8501](http://localhost:8501)
 - **FastAPI Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- *Note: The `api` container automatically connects to a local Ollama instance on your host machine via `http://host.docker.internal:11434/v1`.*
 
-#### Option 2: Running Locally via `uv`
-
-1. **Start the infrastructure** (Postgres, Qdrant, Neo4j):
-   ```bash
-   docker compose up -d
-   ```
-2. **Start the Taskiq Worker** (syncs and embeds markdown docs every 60 seconds):
-   ```bash
-   uv run python -m app.worker
-   ```
-3. **Start the FastAPI backend**:
-   ```bash
-   uv run uvicorn main:app --reload --port 8000
-   ```
-4. **Start the Streamlit chat UI**:
-   ```bash
-   uv run streamlit run frontend.py --server.port 8501
-   ```
+`make ps` shows infrastructure container status and `make down` stops them.
 
 ---
 
 ### 5. Building the Knowledge Graph
 Vector search works as soon as the worker has indexed the docs. The graph branch needs one explicit build step, which fully rebuilds the Neo4j graph from the chunks stored in Postgres using LLM-based extraction:
 ```bash
-uv run python -m app.graph_rag sync
+make sync
 ```
 Re-run it whenever documentation changes materially; it wipes and rebuilds the graph in place.
 
@@ -140,8 +144,8 @@ Re-run it whenever documentation changes materially; it wipes and rebuilds the g
 Backing up the extracted graph protects it from an accidental wipe: a backup can always be restored without re-running the expensive LLM extraction sync. The Neo4j container is stopped for a few seconds during either operation and restarted automatically (PostgreSQL and Qdrant stay up):
 
 ```bash
-./scripts/neo4j_backup.sh save
-./scripts/neo4j_backup.sh restore backups/neo4j_<timestamp>.tar.gz
+make backup
+make restore BACKUP=backups/neo4j_<timestamp>.tar.gz
 ```
 
 `save` archives the Neo4j `/data` directory to a timestamped compressed file in `backups/`; `restore` deletes the current graph data and extracts the archive in its place.
