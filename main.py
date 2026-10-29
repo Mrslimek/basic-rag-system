@@ -55,7 +55,7 @@ class ChatRequest(BaseModel):
     top_k: int = Field(default=3, ge=1, le=10, description="Number of context passages to retrieve")
     retrieve_mode: Literal["vector", "graph", "hybrid"] = Field(
         default="vector",
-        description="RAG branch: 'vector' = Qdrant semantic search, 'graph' = LlamaIndex PropertyGraphIndex over Neo4j, 'hybrid' = vector chunks with Neo4j graph facts appended to their context",
+        description="RAG branch: 'vector' = Qdrant semantic search; 'graph' = knowledge-graph retrieval over Neo4j (entities and relations, no LLM in retrieval); 'hybrid' = vector chunks with Neo4j graph facts appended to their context",
     )
 
 
@@ -79,7 +79,7 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    """RAG endpoint: LlamaIndex retrieval and LLM synthesis over the Qdrant collection."""
+    """RAG endpoint: Haystack retrieval (Qdrant, Neo4j graph, or hybrid) with LLM synthesis."""
     try:
         llm_reply, results = await query.aquery(
             question=request.message,
@@ -88,8 +88,8 @@ async def chat_endpoint(request: ChatRequest):
             retrieve_mode=request.retrieve_mode,
         )
     except Exception as e:
-        logger.exception("Error during LlamaIndex query")
-        raise HTTPException(status_code=500, detail=f"LlamaIndex retrieval error: {e!s}")
+        logger.exception("Error during RAG query")
+        raise HTTPException(status_code=500, detail=f"RAG retrieval error: {e!s}")
 
     sources = [
         SourceReference(

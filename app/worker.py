@@ -1,14 +1,45 @@
+"""
+THE DOCUMENTATION SYNC WORKER — Haystack-native ingestion.
+
+  docs_mock/*.md  = markdown service specifications, scanned every 60 seconds
+                    by a taskiq schedule (LabelScheduleSource).
+  Splitter        = Haystack DocumentSplitter(split_by="function", ...) driven
+                    by split_markdown_sections below: ATX-heading sections,
+                    byte-for-byte identical to the v1 MarkdownNodeParser
+                    segmentation on this corpus (verified 52/52 against the
+                    live Postgres chunk rows).
+  Postgres        = source of truth: Service + ServiceDocumentationChunk rows
+                    (hash-skipped when unchanged).
+  Qdrant          = derived store: one point per chunk; through the Haystack
+                    store API a point's id IS the chunk UUID (payload round-
+                    trip), so a Qdrant point joins to exactly one Postgres row
+                    and to one Neo4j Chunk node. The raw point id Qdrant keeps
+                    is the store's deterministic uuid5 hash of that UUID
+                    (qdrant-haystack convert_id), which is why the raw client
+                    used below must apply the same mapping. Embedding happens
+                    with the shared "passage: "-prefixed document embedder
+                    from app.embeddings; metadata is payload-only, never
+                    embedded.
+  Neo4j           = NOT touched here: graph extraction is app.graph_rag's job
+                    (uv run python -m app.graph_rag sync).
+
+Resync contract: changed/new services get NEW chunk UUIDs, so the worker
+captures the old chunk ids BEFORE deleting the old rows and drops the old
+points directly via AsyncQdrantClient (the embedding writer itself only
+upserts by id and cannot clean orphans).
+"""
 import asyncio
 import hashlib
 import logging
+import re
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
-from typing import cast
 
-from llama_index.core import Document
-from llama_index.core.ingestion import IngestionPipeline
-from llama_index.core.node_parser import MarkdownNodeParser
-from llama_index.core.schema import TextNode
+from haystack import Document
+from haystack.components.preprocessors import DocumentSplitter
+from haystack.document_stores.types import DuplicatePolicy
+from haystack_integrations.document_stores.qdrant.converters import convert_id
 from qdrant_client import AsyncQdrantClient, models
 from sqlalchemy import delete, select
 from taskiq import InMemoryBroker, TaskiqScheduler
@@ -16,9 +47,9 @@ from taskiq.schedule_sources import LabelScheduleSource
 
 from app.config import get_settings
 from app.database import get_db_context, init_db
-from app.embeddings import get_embedding_model
+from app.embeddings import get_document_embedder
 from app.models import Service, ServiceDocumentationChunk
-from app.vector_rag import METADATA_KEYS, build_vector_store, ensure_collection
+from app.vector_rag import build_vector_store, ensure_collection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docs_sync_worker")
@@ -34,10 +65,35 @@ scheduler = TaskiqScheduler(
     sources=[LabelScheduleSource(broker)],
 )
 
-# Raw async client only for point deletions: llama-index-core 0.1x's
-# IngestionPipeline.arun has no delete_ids kwarg (pipeline.py:746 signature),
-# so orphan cleanup goes straight to Qdrant by point id.
+# Raw async client only for point deletions: index_chunks upserts current rows
+# via the Haystack store but has no delete path for the previous run's points,
+# so orphan cleanup goes straight to Qdrant by raw point id (mapped through
+# qdrant-haystack's convert_id, the same hash the store applies on write).
 _qdrant_client: AsyncQdrantClient | None = None
+
+# ATX headings (# ... ######) open a new section; line-joined section text
+# keeps internal blank lines and strips only the newlines at its edges.
+_MARKDOWN_HEADER_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
+
+
+def split_markdown_sections(markdown_text: str) -> list[str]:
+    """
+    Split a markdown document into one section per ATX heading.
+
+    Reproduces the v1 MarkdownNodeParser segmentation exactly: every line
+    starting with "# " ... "###### " begins a new section that runs until the
+    next such line; the section text keeps internal blank lines and strips
+    only leading/trailing newlines. Parity with the 52 live Postgres chunk
+    rows was verified byte-for-byte (wave 4, check 2).
+    """
+    positions = [match.start() for match in _MARKDOWN_HEADER_RE.finditer(markdown_text)]
+    if not positions:
+        return [markdown_text.strip("\n")] if markdown_text.strip() else []
+    positions.append(len(markdown_text))
+    return [
+        markdown_text[start:end].strip("\n")
+        for start, end in pairwise(positions)
+    ]
 
 
 def get_qdrant_client() -> AsyncQdrantClient:
@@ -57,53 +113,54 @@ async def delete_old_vectors(old_chunk_ids: list) -> None:
 
     The re-synced chunks get NEW uuids, so without this the old points would
     linger as orphans: vector hits pointing at Postgres rows that no longer
-    exist. Point ids are the chunk UUIDs (str), set at indexing time.
+    exist. QdrantDocumentStore writes each chunk under the deterministic hash
+    qdrant-haystack derives from the chunk UUID (convert_id), so the raw
+    client must apply the same mapping before deleting by point id.
     """
     if not old_chunk_ids:
         return
     await get_qdrant_client().delete(
         collection_name=settings.QDRANT_COLLECTION,
-        points_selector=models.PointIdsList(points=[str(cid) for cid in old_chunk_ids]),
+        points_selector=models.PointIdsList(
+            points=[convert_id(str(cid)) for cid in old_chunk_ids]
+        ),
     )
 
 
-async def index_chunks(
+def index_chunks(
     chunk_rows: list[ServiceDocumentationChunk],
     service_record: Service,
     file_path: Path,
 ) -> None:
-    """Embed and upsert chunk rows into Qdrant via a LlamaIndex pipeline.
+    """Embed and upsert chunk rows into Qdrant via the Haystack document store.
 
-    One node per chunk, keyed by the chunk's own UUID, so Postgres and Qdrant
-    share the same id (a cross-store FK). Upsert is idempotent by id.
+    One Document per chunk, keyed by the chunk's own UUID, so Postgres and
+    Qdrant share the same id (a cross-store FK). The embedder only consumes
+    Document.content; the provenance meta is payload-only, never embedded.
+    Upsert is idempotent by id (DuplicatePolicy.OVERWRITE).
     """
-    nodes = [
-        TextNode(
-            id_=str(row.id),
-            text=row.content,
-            metadata={
+    documents = [
+        Document(
+            id=str(row.id),
+            content=row.content,
+            meta={
                 "service_name": service_record.name,
                 "service_id": str(service_record.id),
                 "doc_file_path": str(file_path),
                 "chunk_index": row.chunk_index,
             },
-            # Provenance fields help retrieval filtering, not the vector itself.
-            excluded_embed_metadata_keys=list(METADATA_KEYS),
         )
         for row in chunk_rows
     ]
-    pipeline = IngestionPipeline(
-        transformations=[get_embedding_model()],
-        vector_store=build_vector_store(),
-    )
-    await pipeline.arun(nodes=nodes)
+    embedded = get_document_embedder().run(documents=documents)["documents"]
+    build_vector_store().write_documents(embedded, policy=DuplicatePolicy.OVERWRITE)
 
 
 async def sync_document_file(file_path: Path) -> bool:
     """
-    Splits a single markdown document into sections via MarkdownNodeParser,
-    compares hash with database, and updates documentation chunks &
-    embeddings if modified.
+    Splits a single markdown document into sections via the Haystack
+    DocumentSplitter, compares hash with database, and updates documentation
+    chunks & embeddings if modified.
 
     Returns:
         True if updated or inserted, False if skipped because unchanged.
@@ -124,23 +181,19 @@ async def sync_document_file(file_path: Path) -> bool:
 
         logger.info(f"Synchronizing documentation for microservice '{service_name}'...")
 
-        # 1. Chunk document into markdown sections with LlamaIndex's
-        # MarkdownNodeParser (pure text parsing, so the sync API is fine).
-        # Verified against the parser source and docs_mock files: each node's
-        # text STARTS with its own heading line ("## Endpoints") followed by
-        # the section body, so heading and content stay together in stored
-        # text with no prepending needed. The metadata key "header_path" holds
-        # only the ANCESTOR headers (ex "/Overview/"), kept on the node for
-        # retrieval-time context, not stored in the chunk row.
-        # MarkdownNodeParser yields TextNode instances; the llama-index stub
-        # widens the return type to BaseNode, which has no .text.
-        nodes = cast(
-            list[TextNode],
-            MarkdownNodeParser.from_defaults().get_nodes_from_documents(
-                [Document(text=content)]
-            ),
+        # 1. Chunk the document: Haystack DocumentSplitter with the heading
+        # splitting function. Each split Document starts with its own heading
+        # line ("## Endpoints") followed by the section body, so heading and
+        # content stay together in the stored text. Empty sections are
+        # discarded exactly like v1 (node.text.strip()).
+        splitter = DocumentSplitter(
+            split_by="function",
+            splitting_function=split_markdown_sections,
         )
-        chunks = [node.text for node in nodes if node.text.strip()]
+        split_documents = splitter.run(documents=[Document(content=content)])[
+            "documents"
+        ]
+        chunks = [doc.content for doc in split_documents if doc.content and doc.content.strip()]
         if not chunks:
             logger.warning(f"No valid markdown chunks extracted from {file_path}")
             return False
@@ -176,8 +229,8 @@ async def sync_document_file(file_path: Path) -> bool:
             session.add(service_record)
             await session.flush()  # populate service_record.id
 
-        # 3. Insert chunk rows (pure text in Postgres). Graph extraction happens
-        # in app/graph_rag's LlamaIndex pipeline against Neo4j, not here.
+        # 3. Insert chunk rows (pure text in Postgres). Graph extraction
+        # happens in app/graph_rag against Neo4j, not here.
         chunk_rows: list[ServiceDocumentationChunk] = []
         for chunk_index, chunk_text in enumerate(chunks):
             chunk_row = ServiceDocumentationChunk(
@@ -191,9 +244,10 @@ async def sync_document_file(file_path: Path) -> bool:
         await session.flush()  # populate chunk_row.id (python-side uuid4 defaults)
 
         # 4. Vector side: drop the previous run's points, then embed + upsert
-        # the new ones through the LlamaIndex ingestion pipeline.
+        # the new ones through the shared Haystack embedder/store. Embedding
+        # is blocking I/O, so it runs off the event loop.
         await delete_old_vectors(old_chunk_ids)
-        await index_chunks(chunk_rows, service_record, file_path)
+        await asyncio.to_thread(index_chunks, chunk_rows, service_record, file_path)
 
         await session.commit()
         logger.info(

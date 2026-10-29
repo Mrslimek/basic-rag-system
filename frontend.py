@@ -30,7 +30,7 @@ with st.sidebar:
         "RAG mode",
         options=["vector", "graph", "hybrid"],
         index=0,
-        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval via LlamaIndex PropertyGraphIndex (Neo4j); hybrid = vector chunks with Neo4j graph facts appended to the context",
+        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval over Neo4j (entities and relations, no LLM in retrieval); hybrid = vector chunks with Neo4j graph facts appended to the context",
     )
     st.caption("vector finds passages by embedding similarity; graph follows relationships in the knowledge graph; hybrid combines both (vector-first, graph facts appended).")
 

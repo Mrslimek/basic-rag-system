@@ -318,9 +318,13 @@ def get_driver() -> Driver:
     Process-wide singleton of the raw neo4j driver (its internal connection
     pool): the graph branch speaks Cypher directly instead of using the
     neo4j-haystack integration (v1's Neo4jPropertyGraphStore analogue).
+    Transaction retries are capped at 5s so an unreachable server degrades
+    to a plain exception fast instead of the driver's ~30s default window.
     """
     return GraphDatabase.driver(
-        settings.NEO4J_URI, auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+        settings.NEO4J_URI,
+        auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+        max_transaction_retry_time=5.0,
     )
 
 
