@@ -25,6 +25,10 @@ dependencies = [
     # stale (pure-Python glue) and the package works on our 3.14 runtime.
     "llama-index-embeddings-fastembed>=0.7.0",
     "llama-index-graph-stores-neo4j>=0.8.0",
+    "haystack-ai>=3.4.1",
+    "qdrant-haystack>=13.1.0",
+    "fastembed-haystack>=3.0.0",
+    "neo4j-haystack>=2.2.1",
 ]
 
 [project.optional-dependencies]
