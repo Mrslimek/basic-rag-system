@@ -1,85 +1,138 @@
+"""
+Vector-branch smoke tests over the live Qdrant server.
+
+Every test writes into a throwaway zztest_* collection (fixture in
+conftest.py) and never touches the live doc_chunks collection; the real e5
+embedder is used on both write and query sides, and no LLM is involved.
+"""
 import uuid
 
-from llama_index.core import VectorStoreIndex
-from llama_index.core.ingestion import IngestionPipeline
-from llama_index.core.schema import TextNode
-from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
+from haystack import Document
+from haystack.document_stores.types import DuplicatePolicy
+from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
 
-from app.vector_rag import (
-    FILTER_SERVICE_KEY,
-    METADATA_KEYS,
-    build_vector_store,
-    get_llama_embedding,
-    get_sync_client,
-)
+from app.embeddings import get_document_embedder
+from app.vector_rag import build_retrieval_pipeline
+
+_QUERY = "How do recurring payments work?"
 
 
-def _make_nodes(suffix: str) -> list[TextNode]:
-    # Node ids must be valid Qdrant point ids (uuid or unsigned int) — in the real
-    # pipeline they are the chunk UUIDs; here fresh random ones.
+def _seed_documents(suffix: str, count: int = 3) -> list[Document]:
+    seeds = [
+        (
+            "Billing Service manages subscriptions and recurring payments via Stripe.",
+            f"zzvec_{suffix}_billing",
+        ),
+        (
+            "Auth Service issues Ed25519 JWT bearer tokens and publishes JWKS keys.",
+            f"zzvec_{suffix}_auth",
+        ),
+        (
+            "Ledger Service records double-entry accounting entries in PostgreSQL.",
+            f"zzvec_{suffix}_ledger",
+        ),
+    ]
     return [
-        TextNode(
-            id_=str(uuid.uuid4()),
-            text="Billing Service manages subscriptions and recurring payments via Stripe.",
-            metadata={
-                "service_name": f"billing-{suffix}",
-                "service_id": "1",
-                "doc_file_path": "/mock/billing.md",
+        Document(
+            id=str(uuid.uuid4()),
+            content=content,
+            meta={
+                "service_name": service_name,
+                "service_id": str(uuid.uuid4()),
+                "doc_file_path": f"/mock/{service_name}.md",
                 "chunk_index": 0,
             },
-            excluded_embed_metadata_keys=list(METADATA_KEYS),
-        ),
-        TextNode(
-            id_=str(uuid.uuid4()),
-            text="Auth Service issues Ed25519 JWT bearer tokens and publishes JWKS public keys.",
-            metadata={
-                "service_name": f"auth-{suffix}",
-                "service_id": "2",
-                "doc_file_path": "/mock/auth.md",
-                "chunk_index": 0,
-            },
-            excluded_embed_metadata_keys=list(METADATA_KEYS),
-        ),
+        )
+        for content, service_name in seeds[:count]
     ]
 
 
-async def test_llama_ingestion_retrieval_and_metadata_filter():
-    """Smoke test for the LlamaIndex pipeline WITHOUT the LLM:
-    IngestionPipeline embeds our nodes -> Qdrant collection -> retriever ranks
-    the billing node first for a payments query, and MetadataFilters restrict
-    recall to a single service (the framework equivalent of service_filter).
-    Uses a throwaway collection named with a random suffix."""
-    suffix = uuid.uuid4().hex[:8]
-    collection = f"test_llama_{suffix}"
-    try:
-        store = build_vector_store(collection)
-        pipeline = IngestionPipeline(transformations=[get_llama_embedding()], vector_store=store)
-        await pipeline.arun(nodes=_make_nodes(suffix))
+def _write_seeds(store: QdrantDocumentStore, documents: list[Document]) -> None:
+    embedded = get_document_embedder().run(documents=documents)["documents"]
+    store.write_documents(embedded, policy=DuplicatePolicy.OVERWRITE)
 
-        assert get_sync_client().count(collection, exact=True).count == 2
 
-        index = VectorStoreIndex.from_vector_store(store, embed_model=get_llama_embedding())
+def test_write_read_roundtrip_and_service_filter(
+    test_vector_store: QdrantDocumentStore,
+) -> None:
+    suffix = uuid.uuid4().hex[:6]
+    documents = _seed_documents(suffix)
+    billing = documents[0]
+    _write_seeds(test_vector_store, documents)
 
-        hits = await index.as_retriever(similarity_top_k=2).aretrieve(
-            "How do recurring payments work?"
-        )
-        assert hits
-        assert hits[0].node.metadata["service_name"] == f"billing-{suffix}"
-        # Score is cosine on our shared e5 vectors -> comparable to the hand-written path.
-        top_score = hits[0].score
-        last_score = hits[-1].score
-        assert len(hits) == 1 or (
-            top_score is not None and last_score is not None and top_score > last_score
-        )
+    assert test_vector_store.count_documents() == len(documents)
 
-        filtered = index.as_retriever(
-            similarity_top_k=2,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key=FILTER_SERVICE_KEY, value=f"auth-{suffix}")]
-            ),
-        )
-        hits = await filtered.aretrieve("subscription payments refund")
-        assert len(hits) == 1
-        assert all(h.node.metadata["service_name"] == f"auth-{suffix}" for h in hits)
-    finally:
-        get_sync_client().delete_collection(collection)
+    found = test_vector_store.filter_documents(
+        filters={
+            "field": "meta.service_name",
+            "operator": "==",
+            "value": f"zzvec_{suffix}_billing",
+        }
+    )
+    assert len(found) == 1
+    assert found[0].id == billing.id
+    assert found[0].content == billing.content
+    assert found[0].meta["service_name"] == f"zzvec_{suffix}_billing"
+    assert found[0].meta["chunk_index"] == 0
+
+
+def test_overwrite_upsert_is_idempotent(
+    test_vector_store: QdrantDocumentStore,
+) -> None:
+    documents = _seed_documents(uuid.uuid4().hex[:6], count=2)
+    _write_seeds(test_vector_store, documents)
+    _write_seeds(test_vector_store, documents)
+    assert test_vector_store.count_documents() == 2
+
+    updated = Document(
+        id=documents[0].id,
+        content="Billing Service handles refunds through the Adyen gateway.",
+        meta=dict(documents[0].meta),
+    )
+    _write_seeds(test_vector_store, [updated])
+    assert test_vector_store.count_documents() == 2
+    found = test_vector_store.filter_documents(
+        filters={
+            "field": "meta.service_name",
+            "operator": "==",
+            "value": documents[0].meta["service_name"],
+        }
+    )
+    assert len(found) == 1
+    assert found[0].content == updated.content
+
+
+def test_retrieval_pipeline_ranks_billing_chunk_first(
+    test_vector_store: QdrantDocumentStore,
+) -> None:
+    suffix = uuid.uuid4().hex[:6]
+    _write_seeds(test_vector_store, _seed_documents(suffix))
+
+    pipeline = build_retrieval_pipeline(top_k=2, store=test_vector_store)
+    result = pipeline.run({"text_embedder": {"text": _QUERY}})
+    documents = result["retriever"]["documents"]
+
+    assert len(documents) == 2
+    assert documents[0].meta["service_name"] == f"zzvec_{suffix}_billing"
+    first_score = documents[0].score
+    second_score = documents[1].score
+    assert first_score is not None and second_score is not None
+    assert first_score >= second_score
+
+
+def test_retrieval_service_filter_narrows_to_one_service(
+    test_vector_store: QdrantDocumentStore,
+) -> None:
+    suffix = uuid.uuid4().hex[:6]
+    _write_seeds(test_vector_store, _seed_documents(suffix))
+
+    pipeline = build_retrieval_pipeline(
+        top_k=3,
+        service_filter=f"zzvec_{suffix}_auth",
+        store=test_vector_store,
+    )
+    result = pipeline.run({"text_embedder": {"text": "JWKS token issuance"}})
+    documents = result["retriever"]["documents"]
+
+    assert len(documents) == 1
+    assert documents[0].meta["service_name"] == f"zzvec_{suffix}_auth"
