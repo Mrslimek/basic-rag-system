@@ -1,20 +1,24 @@
 """
-THE VECTOR branch of the single LlamaIndex pipeline — the Qdrant-rebuild half.
+THE VECTOR branch of the Haystack pipeline — the Qdrant-rebuild-and-retrieve half.
 
   Postgres   = source of truth for chunk text (unchanged, worker-owned).
   Qdrant     = ONE collection (default `doc_chunks`), owned by this module.
-               QdrantVectorStore writes its own payload shape (node text +
-               metadata flattened into top-level payload keys) — the hand-made
-               points the ingest worker used to create are superseded by
-               `sync` below.
+               QdrantDocumentStore writes chunks as points whose id is the
+               chunk UUID and whose payload nests provenance under "meta." —
+               the filter key is therefore "meta.service_name".
   Chunks     = metadata shape {service_name, service_id, doc_file_path,
-               chunk_index} — METADATA_KEYS/TYPES below, flattened into
-               top-level payload keys and excluded from the embedded text on
-               purpose: identical input -> identical vector.
-  Embeddings = the process-wide e5-small model from app.embeddings
-               (get_embedding_model) — the same ONNX weights, prefixes and
-               normalization as always, so vectors stay interchangeable with
-               existing points.
+               chunk_index} — METADATA_KEYS below. Metadata is stored in the
+               payload but never embedded: identical input -> identical vector.
+  Embeddings = the process-wide e5-small embedders from app.embeddings
+               (get_document_embedder / get_text_embedder) — same ONNX
+               weights and "passage: "/"query: " prefixes as always.
+  Indexing   = sync_from_postgres does a FULL rebuild, not an incremental
+               upsert: the worker replaces chunk rows with NEW uuids on
+               resync, so old point ids would dangle — the same orphan
+               problem we solved with delete_by_service in app/worker.py,
+               solved here by rebuild. Point id = chunk UUID keeps the
+               cross-store join key stable: a Qdrant point id resolves to
+               exactly one Postgres chunk row.
 
 Run the full index rebuild after corpus changes:
     uv run python -m app.vector_rag sync
@@ -23,118 +27,114 @@ import asyncio
 import logging
 import sys
 
-from llama_index.core import VectorStoreIndex
-from llama_index.core.base.embeddings.base import BaseEmbedding
-from llama_index.core.ingestion import IngestionPipeline
-from llama_index.core.schema import TextNode
-from llama_index.core.vector_stores import MetadataInfo, VectorStoreInfo
-from llama_index.vector_stores.qdrant import QdrantVectorStore
-from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client import models as qm
-from sqlalchemy import select
+from haystack import Document, Pipeline
+from haystack.document_stores.types import DuplicatePolicy
+from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
+from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+from qdrant_client import QdrantClient
+from sqlalchemy import RowMapping, select
 
 from app.config import get_settings
 from app.database import get_db_context
-from app.embeddings import get_embedding_model
+from app.embeddings import get_document_embedder, make_text_embedder
 from app.models import Service, ServiceDocumentationChunk
 
 logger = logging.getLogger("vector_rag")
 settings = get_settings()
 
-# Metadata attached to every indexed node. QdrantVectorStore (this version)
-# flattens node.metadata into top-level payload keys and its filter converter
-# uses MetadataFilter.key verbatim — so the filter/payload-index key here is
-# plain "service_name" (verified against the live collection payload).
+# Metadata attached to every indexed Document. QdrantDocumentStore nests the
+# meta dict under the "meta." payload namespace (verified against the qdrant
+# payload built by qdrant-haystack 13.1.0), so retrieval filters must use the
+# "meta.service_name" field path — FILTER_SERVICE_KEY holds the bare key.
 METADATA_KEYS = ("service_name", "service_id", "doc_file_path", "chunk_index")
-METADATA_TYPES = {"service_name": "str", "service_id": "str", "doc_file_path": "str", "chunk_index": "num"}
 FILTER_SERVICE_KEY = "service_name"
 
 
-def get_llama_embedding() -> BaseEmbedding:
-    """The process-wide embedding model, owned by app.embeddings."""
-    return get_embedding_model()
-
-
-_sync_client: QdrantClient | None = None
-
-
-def get_sync_client() -> QdrantClient:
-    """Sync client for DDL ops (create/delete collection)."""
-    global _sync_client
-    if _sync_client is None:
-        _sync_client = QdrantClient(url=settings.QDRANT_URL, timeout=30)
-    return _sync_client
-
-
-_async_client: AsyncQdrantClient | None = None
-
-
-def get_async_client() -> AsyncQdrantClient:
-    """Async client for point ops — vector_rag owns its Qdrant connections."""
-    global _async_client
-    if _async_client is None:
-        _async_client = AsyncQdrantClient(url=settings.QDRANT_URL, timeout=30)
-    return _async_client
-
-
-def ensure_collection(collection_name: str) -> None:
-    """Idempotent DDL: cosine over unit-normalized vectors + payload index for
-    the filterable metadata key."""
-    client = get_sync_client()
-    if not client.collection_exists(collection_name):
-        client.create_collection(
-            collection_name=collection_name,
-            vectors_config=qm.VectorParams(
-                size=settings.EMBEDDING_DIMENSION,
-                distance=qm.Distance.COSINE,
-            ),
-        )
-        client.create_payload_index(
-            collection_name, FILTER_SERVICE_KEY, field_schema=qm.PayloadSchemaType.KEYWORD
-        )
-        logger.info(f"Created Qdrant collection '{collection_name}' for LlamaIndex")
-
-
-def build_vector_store(collection_name: str | None = None) -> QdrantVectorStore:
-    name = collection_name or settings.QDRANT_COLLECTION
-    ensure_collection(name)
-    return QdrantVectorStore(
-        collection_name=name,
-        client=get_sync_client(),
-        aclient=get_async_client(),
-        text_key="text",
-        metadata_config=VectorStoreInfo(
-            metadata_info=[
-                MetadataInfo(name=k, type=METADATA_TYPES[k], description=f"provenance metadata: {k}")
-                for k in METADATA_KEYS
-            ],
-            content_info="Markdown chunk of a microservice specification (endpoints, payloads, behavior)",
-        ),
-        payload_indexes=[{"field_name": FILTER_SERVICE_KEY, "field_schema": qm.PayloadSchemaType.KEYWORD}],  # ty: ignore[invalid-argument-type] llama-index stub types every payload_indexes value as PayloadSchemaType; real entries mix str field_name with enum field_schema
+def ensure_collection(index_name: str) -> QdrantDocumentStore:
+    """
+    Store over `index_name`, creating the collection + service_name payload
+    index on first use. The QdrantDocumentStore constructor itself performs
+    the idempotent DDL, so there is no separate collection-management path.
+    """
+    return QdrantDocumentStore(
+        url=settings.QDRANT_URL,
+        index=index_name,
+        embedding_dim=settings.EMBEDDING_DIMENSION,
+        recreate_index=False,
+        wait_result_from_api=True,
+        progress_bar=False,
+        payload_fields_to_index=[
+            {"field_name": FILTER_SERVICE_KEY, "field_schema": "keyword"},
+        ],
     )
 
 
-def build_index(collection_name: str | None = None) -> VectorStoreIndex:
-    """Index over the existing collection — no local document store: the index is
-    a derived view, Qdrant + Postgres own the data."""
-    store = build_vector_store(collection_name)
-    return VectorStoreIndex.from_vector_store(store, embed_model=get_llama_embedding())
+# One collection = one store per process: stores hold client pools and are
+# collection-specific, so they are memoized per index name, not per call.
+_vector_stores: dict[str, QdrantDocumentStore] = {}
 
 
-async def sync_from_postgres() -> dict[str, int]:
+def build_vector_store(index_name: str | None = None) -> QdrantDocumentStore:
+    """Memoized store for the default collection (or an explicit index name)."""
+    name = index_name or settings.QDRANT_COLLECTION
+    if name not in _vector_stores:
+        _vector_stores[name] = ensure_collection(name)
+    return _vector_stores[name]
+
+
+def build_retrieval_pipeline(
+    top_k: int = 4,
+    service_filter: str | None = None,
+    store: QdrantDocumentStore | None = None,
+) -> Pipeline:
     """
-    Full rebuild of the LlamaIndex index into the Qdrant collection.
+    Retrieval pipeline: text_embedder (query prefix) -> retriever over Qdrant.
 
-    Why full rebuild instead of incremental upsert: worker resyncs replace chunk
-    rows with NEW uuids, so the old node ids would dangle — same orphan problem
-    we solved with delete_by_service in app/worker.py, solved here by rebuild.
-    Node id = chunk UUID keeps the cross-store join key stable: a Qdrant point
-    id resolves to exactly one Postgres chunk row.
+    Run contract:
+        result = pipeline.run({"text_embedder": {"text": q}})
+        result["retriever"]["documents"]  # list[Document] with id/score/meta
+
+    service_filter narrows the search to one service via the legacy dict
+    filter syntax ({"field": "meta.service_name", "operator": "==", ...}).
     """
-    name = settings.QDRANT_COLLECTION
-    async with get_db_context() as session:
-        rows = (
-            await session.execute(
+    filters = None
+    if service_filter:
+        filters = {
+            "field": f"meta.{FILTER_SERVICE_KEY}",
+            "operator": "==",
+            "value": service_filter,
+        }
+
+    pipeline = Pipeline()
+    # make_text_embedder, not get_text_embedder: one component instance
+    # cannot be added to two pipelines (PipelineError), and this factory is
+    # called once per query (service_filter varies).
+    pipeline.add_component("text_embedder", make_text_embedder())
+    pipeline.add_component(
+        "retriever",
+        QdrantEmbeddingRetriever(
+            document_store=store or build_vector_store(),
+            top_k=top_k,
+            filters=filters,
+        ),
+    )
+    pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
+    return pipeline
+
+
+def _load_chunk_rows() -> list[RowMapping]:
+    """
+    Chunk rows joined with service provenance, ordered for a stable rebuild.
+
+    The query runs inside a short-lived event loop: app.database exposes only
+    the asyncpg async session, while this module (and the Haystack pipeline
+    it feeds) is synchronous. sync_from_postgres is a CLI entry point, so no
+    loop is running at call time.
+    """
+
+    async def _fetch() -> list[RowMapping]:
+        async with get_db_context() as session:
+            result = await session.execute(
                 select(
                     ServiceDocumentationChunk.id,
                     ServiceDocumentationChunk.content,
@@ -146,40 +146,63 @@ async def sync_from_postgres() -> dict[str, int]:
                 .join(Service, Service.id == ServiceDocumentationChunk.service_id)
                 .order_by(Service.name, ServiceDocumentationChunk.chunk_index)
             )
-        ).all()
+            return list(result.mappings())
 
-    nodes = [
-        TextNode(
-            id_=str(row.id),
-            text=row.content,
-            metadata={
-                "service_name": row.name,
-                "service_id": str(row.service_id),
-                "doc_file_path": row.doc_file_path,
-                "chunk_index": row.chunk_index,
+    return asyncio.run(_fetch())
+
+
+def _build_documents(rows: list[RowMapping]) -> list[Document]:
+    """Chunk rows -> Documents with the METADATA_KEYS provenance payload."""
+    return [
+        Document(
+            id=str(row["id"]),
+            content=row["content"],
+            meta={
+                "service_name": row["name"],
+                "service_id": str(row["service_id"]),
+                "doc_file_path": row["doc_file_path"],
+                "chunk_index": row["chunk_index"],
             },
-            # Embed the raw paragraph only: identical input -> identical vector as
-            # the hand-written pipeline (metadata stays visible to the LLM).
-            excluded_embed_metadata_keys=list(METADATA_KEYS),
         )
         for row in rows
     ]
 
-    get_sync_client().delete_collection(name)
-    ensure_collection(name)
-    store = build_vector_store(name)
-    pipeline = IngestionPipeline(transformations=[get_llama_embedding()], vector_store=store)
-    await pipeline.arun(nodes=nodes)
 
-    total = get_sync_client().count(name, exact=True).count
-    logger.info(f"LlamaIndex collection rebuilt: {total} points from {len(rows)} chunks")
+def sync_from_postgres() -> dict[str, int]:
+    """
+    Full rebuild of the Qdrant collection from Postgres chunks.
+
+    Why full rebuild instead of incremental upsert: worker resyncs replace
+    chunk rows with NEW uuids, so the old point ids would dangle — solved
+    here by dropping and recreating the whole collection. Point id = chunk
+    UUID keeps the cross-store join key stable.
+    """
+    rows = _load_chunk_rows()
+    name = settings.QDRANT_COLLECTION
+
+    ddl_client = QdrantClient(url=settings.QDRANT_URL)
+    if ddl_client.collection_exists(name):
+        ddl_client.delete_collection(name)
+
+    # A cached store would hold a lazy client pointed at the just-deleted
+    # collection; drop it so build_vector_store constructs a fresh store
+    # (its constructor recreates the collection).
+    _vector_stores.pop(name, None)
+    store = build_vector_store(name)
+
+    documents = _build_documents(rows)
+    embedded = get_document_embedder().run(documents=documents)["documents"]
+    store.write_documents(embedded, policy=DuplicatePolicy.OVERWRITE)
+
+    total = store.count_documents()
+    logger.info("Haystack collection rebuilt: %d points from %d chunks", total, len(rows))
     return {"postgres_rows": len(rows), "qdrant_points": total}
 
 
-async def _cli() -> None:
+def _cli() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else ""
     if command == "sync":
-        stats = await sync_from_postgres()
+        stats = sync_from_postgres()
         print(f"synced: {stats}")
     else:
         print("usage: python -m app.vector_rag sync")
@@ -187,4 +210,4 @@ async def _cli() -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(_cli())
+    _cli()
