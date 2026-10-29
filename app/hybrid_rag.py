@@ -1,190 +1,202 @@
 """
-THE HYBRID branch of the single LlamaIndex pipeline — vector-first composition.
+THE HYBRID branch of the Haystack pipeline — vector-first, graph-enriched.
 
-Stage 1 reuses the Qdrant vector stage from app/vector_rag.py exactly like the
-vector branch (same top_k, same service_filter semantics); the Neo4j MENTIONS
-expansion of stages 2-3 runs at retrieve time, reaching the graph store
-through graph_rag.get_graph_store(), so a down Neo4j degrades to the plain
-vector results instead of failing at engine build.
+Stage 1 reuses the Qdrant vector stage from app/vector_rag.py exactly like
+the vector branch (same top_k, same service_filter semantics, same memoized
+store). Stage 2 runs at retrieve time inside FactsExpander: for every
+retrieved chunk the v2 graph schema is consulted — one hop backwards over
+MENTIONS ((e:Entity)-[:MENTIONS]->(c:Chunk), the v2 direction — OPPOSITE to
+v1) resolving the chunk's entities, then one semantic step outward from
+those entities for the typed triplets. The facts land as a "Graph facts:"
+text block appended to the chunk content; any Neo4j error degrades the
+hybrid to the plain vector documents (one warning per call).
+
+Neo4j is reached ONLY through graph_rag.query_cypher, and graph_rag is
+imported lazily inside FactsExpander.run — importing app.hybrid_rag must
+not pull the neo4j driver into sys.modules (the vector-only startup gate).
 """
-import asyncio
 import logging
-from dataclasses import dataclass
+from typing import Any
 
-from llama_index.core.base.base_retriever import BaseRetriever
-from llama_index.core.graph_stores.types import EntityNode, Triplet
-from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode
-from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
-from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
+from haystack import Document, Pipeline, component
 
-from app import graph_rag
-from app.vector_rag import FILTER_SERVICE_KEY, build_index
+from app.vector_rag import build_retrieval_pipeline, build_vector_store
 
 logger = logging.getLogger("hybrid_rag")
 
 
-# Hop 1 of the hybrid expansion: chunk -> MENTIONS -> entity, resolving the
-# entity's display name + type label. Hand-written Cypher because no store
-# primitive walks edges from chunk ids; only the $ids param is injectable.
-_MENTIONS_HOP_QUERY = """
-MATCH (c:Chunk)-[:MENTIONS]->(e:__Entity__)
-WHERE c.id IN $ids
-RETURN c.id AS chunk_id, e.name AS name,
-       [l IN labels(e) WHERE NOT l IN ['__Entity__', '__Node__'] | l][0] AS type
-"""
+# Hop 1 of the hybrid expansion: chunk <- MENTIONS - entity (v2 direction),
+# resolving each entity's display name + its type label (the writer's
+# whitelisted SERVICE/QUEUE/... labels). Only $ids is injectable.
+_MENTIONS_HOP_QUERY = (
+    "MATCH (c:Chunk)<-[:MENTIONS]-(e:Entity) "
+    "WHERE c.id IN $ids "
+    "RETURN c.id AS chunk_id, e.name AS name, "
+    "[l IN labels(e) WHERE l <> 'Entity'][0] AS type"
+)
+
+# Hop 2: one semantic step outward from the mentioned entities (v1 get_rel_map
+# depth=1). MENTIONS is excluded so the walk never returns to chunk text.
+_TRIPLETS_HOP_QUERY = (
+    "MATCH (e:Entity)-[r]->(t:Entity) "
+    "WHERE e.name IN $names AND type(r) <> 'MENTIONS' "
+    "RETURN e.name AS source, type(r) AS relation, t.name AS target"
+)
 
 
-@dataclass(frozen=True)
-class _EntityMention:
-    """One mentioned entity of a chunk: display name + its type label."""
-
-    name: str
-    label: str
-
-
-def build_hybrid_retriever(
+def build_hybrid_pipeline(
     top_k: int = 4,
     service_filter: str | None = None,
     collection_name: str | None = None,
-) -> BaseRetriever:
-    """Hybrid branch: stage 1 reuses the Qdrant retriever exactly like the
-    vector branch (same top_k, same service_filter semantics); the Neo4j
-    expansion runs at retrieve time inside _HybridRetriever, so a down Neo4j
-    degrades to plain vector results instead of failing at engine build."""
-    filters = (
-        MetadataFilters(
-            filters=[MetadataFilter(key=FILTER_SERVICE_KEY, value=service_filter)]
-        )
-        if service_filter
-        else None
+) -> Pipeline:
+    """
+    Hybrid branch: text_embedder -> QdrantEmbeddingRetriever -> FactsExpander.
+
+    The first two stages are the vector branch itself — app.vector_rag.
+    build_retrieval_pipeline wires exactly make_text_embedder() +
+    QdrantEmbeddingRetriever with the legacy meta.service_name filter dict
+    over build_vector_store(collection_name) (None = default collection).
+    FactsExpander then appends the Neo4j facts block without touching
+    meta/id/score.
+
+    Run contract:
+        result = pipeline.run({"text_embedder": {"text": q}})
+        result["facts_expander"]["documents"]  # list[Document], enriched content
+    """
+    pipeline = build_retrieval_pipeline(
+        top_k=top_k,
+        service_filter=service_filter,
+        store=build_vector_store(collection_name),
     )
-    vector_retriever = build_index(collection_name).as_retriever(
-        similarity_top_k=top_k,
-        filters=filters,
-    )
-    return _HybridRetriever(vector_retriever=vector_retriever, top_k=top_k)
+    pipeline.add_component("facts_expander", FactsExpander())
+    pipeline.connect("retriever.documents", "facts_expander.documents")
+    return pipeline
 
 
-class _HybridRetriever(BaseRetriever):
-    """Vector-first hybrid: the Qdrant chunks from stage 1 stay the sources —
-    stages 2-3 only append graph facts to their text. Any Neo4j error during
-    the expansion degrades to the plain vector results (one warning per
-    retrieve call)."""
+@component
+class FactsExpander:
+    """
+    Appends each retrieved chunk's graph facts as a text block.
 
-    def __init__(self, vector_retriever: BaseRetriever, top_k: int) -> None:
-        super().__init__()
-        self._vector_retriever = vector_retriever
-        self._top_k = top_k
+    Two batched queries per call (mentions hop + triplets hop) against the v2
+    schema; chunks without mentions pass through untouched and an exotic
+    empty result does the same without a warning. One Neo4j error => one
+    logger.warning => the input documents are returned UNCHANGED — hybrid
+    degrades to plain vector, the v1 contract.
+    Inputs: "documents" (list[Document]) — the Qdrant retriever output.
+    Outputs: {"documents": list[Document]} — same ids/meta/scores, content +
+    the facts block for chunks that have graph facts.
+    """
 
-    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
-        nodes = self._vector_retriever.retrieve(query_bundle)
+    @component.output_types(documents=list[Document])
+    def run(self, documents: list[Document]) -> dict[str, list[Document]]:
+        # Lazy import: graph_rag pulls the neo4j driver into sys.modules, and
+        # app.hybrid_rag must stay neo4j-free at import time.
+        from app import graph_rag
+
         try:
-            # get_graph_store() is contacted here, not at construction: an
-            # unreachable Neo4j must degrade hybrid to the vector results.
-            facts_by_chunk = _expand_graph_facts(
-                graph_rag.get_graph_store(),
-                [node.node_id for node in nodes],
-                self._top_k,
-            )
-        except Exception as exc:  # noqa: BLE001 - any Neo4j failure must degrade hybrid to plain vector results
+            facts_by_chunk = _expand_facts(graph_rag, documents)
+        except Exception as exc:  # noqa: BLE001 - any graph failure must degrade to plain vector documents
             logger.warning(
-                f"Neo4j unavailable during hybrid expansion ({exc}); "
-                "returning plain vector results."
+                "Neo4j unavailable during hybrid expansion (%s); "
+                "returning plain vector results.",
+                exc,
             )
-            return nodes
+            return {"documents": documents}
         if not facts_by_chunk:
-            return nodes
-        return _attach_graph_facts(nodes, facts_by_chunk)
+            return {"documents": documents}
+        return {
+            "documents": [
+                _attach_facts(document, facts_by_chunk)
+                for document in documents
+            ]
+        }
 
-    async def _aretrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
-        # The sync Qdrant client and the Neo4j driver both block; to_thread
-        # keeps them off the event loop (same pattern as the graph sync).
-        return await asyncio.to_thread(self._retrieve, query_bundle)
+
+def _expand_facts(graph_rag: Any, documents: list[Document]) -> dict[str, str]:
+    """Stages 2-3 per retrieved chunk: mentions hop, one triplets hop over the
+    union of mentioned names, packaged into a facts block per chunk id."""
+    chunk_ids = [document.id for document in documents if document.id]
+    if not chunk_ids:
+        return {}
+    mentions_by_chunk = _collect_mentions(graph_rag, chunk_ids)
+    if not mentions_by_chunk:
+        return {}
+    names = sorted(
+        {name for mentions in mentions_by_chunk.values() for name, _ in mentions}
+    )
+    triplets = _semantic_triplets(graph_rag, names)
+    return {
+        chunk_id: _format_graph_facts(mentions, triplets)
+        for chunk_id, mentions in mentions_by_chunk.items()
+    }
 
 
-def _expand_graph_facts(
-    store: Neo4jPropertyGraphStore,
-    chunk_ids: list[str],
-    top_k: int,
-) -> dict[str, str]:
-    """Stages 2-3 per retrieved chunk: hop 1 resolves the mentioned entities
-    over MENTIONS edges, hop 2 walks one semantic step from those entities,
-    and each chunk's result is packaged as its "Graph facts" text block.
-    Chunks without mentions are absent from the returned mapping."""
-    rows = store.structured_query(_MENTIONS_HOP_QUERY, param_map={"ids": chunk_ids})
-    mentions_by_chunk: dict[str, list[_EntityMention]] = {}
+def _collect_mentions(
+    graph_rag: Any, chunk_ids: list[str]
+) -> dict[str, list[tuple[str, str]]]:
+    rows = graph_rag.query_cypher(_MENTIONS_HOP_QUERY, ids=chunk_ids)
+    mentions_by_chunk: dict[str, list[tuple[str, str]]] = {}
     for row in rows:
         name = row.get("name")
         if not name:
             continue
-        mention = _EntityMention(name=name, label=row.get("type") or "ENTITY")
+        mention = (name, row.get("type") or "ENTITY")
         bucket = mentions_by_chunk.setdefault(str(row["chunk_id"]), [])
         if mention not in bucket:
             bucket.append(mention)
-
-    facts: dict[str, str] = {}
-    for chunk_id, mentions in mentions_by_chunk.items():
-        facts[chunk_id] = _format_graph_facts(
-            mentions,
-            _semantic_triplets(store, mentions, top_k),
-        )
-    return facts
+    return mentions_by_chunk
 
 
 def _semantic_triplets(
-    store: Neo4jPropertyGraphStore,
-    mentions: list[_EntityMention],
-    top_k: int,
-) -> list[Triplet]:
-    """Hop 2, via the store's own get_rel_map: its path predicate already
-    excludes MENTIONS from the walk, ignore_rels repeats the same exclusion
-    in the Python post-filter, and Chunk-labelled endpoints are dropped so
-    the walk never returns to chunk text."""
-    triplets = store.get_rel_map(
-        [EntityNode(name=m.name, label=m.label) for m in mentions],
-        depth=1,
-        limit=max(30, top_k * 10),
-        ignore_rels=["MENTIONS"],
-    )
-    return [t for t in triplets if t[0].label != "Chunk" and t[2].label != "Chunk"]
+    graph_rag: Any, names: list[str]
+) -> list[tuple[str, str, str]]:
+    rows = graph_rag.query_cypher(_TRIPLETS_HOP_QUERY, names=names)
+    triplets: list[tuple[str, str, str]] = []
+    for row in rows:
+        source, relation, target = (
+            row.get("source"),
+            row.get("relation"),
+            row.get("target"),
+        )
+        if source and relation and target:
+            triplets.append((source, relation, target))
+    return triplets
 
 
 def _format_graph_facts(
-    mentions: list[_EntityMention], triplets: list[Triplet]
+    mentions: list[tuple[str, str]], triplets: list[tuple[str, str, str]]
 ) -> str:
-    """The chunk's facts block: mentioned entities with their type labels,
-    then deduplicated triplets in the same "X -> REL -> Y" text convention as
-    the graph branch (_get_nodes_with_score in sub_retrievers/base.py)."""
-    lines = [f"- Entities: {', '.join(f'{m.name} ({m.label})' for m in mentions)}"]
+    """The chunk's facts block in the v1 _format_graph_facts layout: mentioned
+    entities with their type labels, then deduplicated "X -> REL -> Y" lines
+    for the triplets whose source is one of this chunk's entities."""
+    entity_line = "- Entities: " + ", ".join(
+        f"{name} ({label})" for name, label in mentions
+    )
+    mentioned_names = {name for name, _ in mentions}
+    lines = [entity_line]
     seen: set[tuple[str, str, str]] = set()
     for source, relation, target in triplets:
-        key = (source.id, relation.id, target.id)
-        if key not in seen:
-            seen.add(key)
-            lines.append(f"- {source.id} -> {relation.id} -> {target.id}")
+        if source not in mentioned_names:
+            continue
+        key = (source, relation, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {source} -> {relation} -> {target}")
     return "Graph facts:\n" + "\n".join(lines)
 
 
-def _attach_graph_facts(
-    nodes: list[NodeWithScore], facts_by_chunk: dict[str, str]
-) -> list[NodeWithScore]:
-    """Stage 3 packaging: same id_/metadata/score as the vector node, text =
+def _attach_facts(document: Document, facts_by_chunk: dict[str, str]) -> Document:
+    """Stage 3 packaging: same id/meta/score as the vector document, content =
     original chunk + appended facts block; chunks without facts pass through
     untouched."""
-    enriched: list[NodeWithScore] = []
-    for node_with_score in nodes:
-        facts = facts_by_chunk.get(node_with_score.node.node_id)
-        if not facts:
-            enriched.append(node_with_score)
-            continue
-        enriched.append(
-            NodeWithScore(
-                node=TextNode(
-                    id_=node_with_score.node.node_id,
-                    text=f"{node_with_score.node.get_content()}\n\n{facts}",
-                    metadata=dict(node_with_score.node.metadata),
-                ),
-                score=node_with_score.score,
-            )
-        )
-    return enriched
+    facts = facts_by_chunk.get(document.id)
+    if not facts:
+        return document
+    return Document(
+        id=document.id,
+        content=f"{document.content}\n\n{facts}",
+        meta=dict(document.meta),
+        score=document.score,
+    )

@@ -1,37 +1,42 @@
 """
-THE RAG pipeline — LlamaIndex is the single retrieval interface.
+THE RAG pipeline — Haystack is the single retrieval interface.
 
-There is exactly one pipeline here: the hand-written retriever and any
-parallel A/B pipeline have been removed. Three retrieval branches live inside
-this single LlamaIndex flow, selected by `retrieve_mode`:
-  vector = the Qdrant collection (default), built by app/vector_rag.py;
-  graph  = PropertyGraphIndex over Neo4j (retriever built by app/graph_rag.py,
-           imported lazily so this module never needs Neo4j at import time);
+One synthesis path serves three retrieval branches, selected by
+`retrieve_mode`:
+  vector = the Qdrant collection (default): text_embedder -> retriever,
+           built by app/vector_rag.py (imported at module top);
+  graph  = the Neo4j v2 graph: text_embedder -> graph_retriever, built by
+           app/graph_rag.py — imported lazily so this module never needs the
+           neo4j driver at import time;
   hybrid = the Qdrant chunks of the vector branch first, then a Neo4j
-           expansion appends each chunk's entities and semantic triplets to
-           its text — also built by app/hybrid_rag.py behind the same lazy
-           import; Neo4j errors degrade to the plain vector results.
-All branches return chunk TextNodes with the same provenance metadata and
-share one synthesis path (same LLM, same SearchResult currency), so a
+           expansion appends each chunk's graph facts to its text — built by
+           app/hybrid_rag.py behind the same lazy import; Neo4j errors
+           degrade to the plain vector documents.
+All branches return chunk Documents with the same provenance metadata and
+score currency and share ONE synthesis path here (SearchResult ->
+build_context -> ChatPromptBuilder -> OpenAIChatGenerator), so a
 vector-vs-graph A/B never leaves this module.
 
-  LLM        = same local llama.cpp endpoint, through llama-index-llms-openai-like.
+  LLM        = the local OpenAI-protocol endpoint through app/llm.py
+               (get_chat_model / build_chat_prompt).
 """
+import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal
 
-from llama_index.core.base.base_query_engine import BaseQueryEngine
-from llama_index.core.llms import LLM
-from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.response_synthesizers import ResponseMode
-from llama_index.core.schema import NodeWithScore
-from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
+from haystack import Document, Pipeline
 
-from app.llm import SYSTEM_INSTRUCTION, get_chat_model
-from app.vector_rag import FILTER_SERVICE_KEY, build_index
+from app.llm import build_chat_prompt, get_chat_model
+from app.vector_rag import build_retrieval_pipeline, build_vector_store
 
 logger = logging.getLogger("query")
+
+_FINAL_COMPONENTS: dict[str, str] = {
+    "vector": "retriever",
+    "graph": "graph_retriever",
+    "hybrid": "facts_expander",
+}
 
 
 @dataclass(frozen=True)
@@ -59,77 +64,55 @@ def build_context(search_results: list[SearchResult]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
-def build_llm() -> LLM:
-    """The project-wide LLM client from app/llm.py, with the shared answer-policy
-    prompt baked in as system_prompt."""
-    return get_chat_model(temperature=0.2, system_prompt=SYSTEM_INSTRUCTION)
+def _build_pipeline(
+    retrieve_mode: Literal["vector", "graph", "hybrid"],
+    top_k: int,
+    service_filter: str | None,
+    collection_name: str | None,
+) -> Pipeline:
+    """Retrieval branch dispatcher.
 
-
-def build_query_engine(
-    top_k: int = 4,
-    service_filter: str | None = None,
-    collection_name: str | None = None,
-    retrieve_mode: Literal["vector", "graph", "hybrid"] = "vector",
-) -> RetrieverQueryEngine | BaseQueryEngine:
-    """RetrieverQueryEngine: compact synthesis puts several small chunks into one prompt.
-
-    vector: Qdrant-backed index (service_filter and collection_name apply).
-    graph:  PropertyGraphIndex retriever from app/graph_rag.py; service_filter is
-    ignored (no per-service filter in this MVP) and the default text-QA prompt
-    is kept.
-    hybrid: vector retrieval first (service_filter and collection_name apply),
-    then Neo4j expansion appends graph facts to the chunk text.
+    vector:  app.vector_rag.build_retrieval_pipeline; service_filter and
+             collection_name apply (the store is only built when an explicit
+             collection is requested; otherwise the memoized default).
+    graph:   app.graph_rag.build_graph_pipeline — imported lazily, inside the
+             branch body, so a Neo4j-free vector-only startup must not fail
+             at import time; service_filter is ignored (no per-service filter
+             in this MVP).
+    hybrid:  app.hybrid_rag.build_hybrid_pipeline behind the same lazy import.
     """
     if retrieve_mode == "graph":
-        # Imported here, not at module top: graph retrieval needs Neo4j, the
-        # vector path must not.
         from app import graph_rag
 
-        return RetrieverQueryEngine.from_args(
-            retriever=graph_rag.build_graph_retriever(top_k=top_k),
-            llm=build_llm(),
-            response_mode=ResponseMode.COMPACT,
-        )
+        return graph_rag.build_graph_pipeline(top_k=top_k)
     if retrieve_mode == "hybrid":
-        # Same lazy import: the Neo4j expansion in the hybrid branch must not
-        # make a Neo4j-free vector-only startup fail at import time.
         from app import hybrid_rag
 
-        return RetrieverQueryEngine.from_args(
-            retriever=hybrid_rag.build_hybrid_retriever(
-                top_k=top_k,
-                service_filter=service_filter,
-                collection_name=collection_name,
-            ),
-            llm=build_llm(),
-            response_mode=ResponseMode.COMPACT,
+        return hybrid_rag.build_hybrid_pipeline(
+            top_k=top_k,
+            service_filter=service_filter,
+            collection_name=collection_name,
         )
-    index = build_index(collection_name)
-    filters = (
-        MetadataFilters(filters=[MetadataFilter(key=FILTER_SERVICE_KEY, value=service_filter)])
-        if service_filter
-        else None
-    )
-    return index.as_query_engine(
-        similarity_top_k=top_k,
-        llm=build_llm(),
-        filters=filters,
-        response_mode="compact",
+    store = build_vector_store(collection_name) if collection_name else None
+    return build_retrieval_pipeline(
+        top_k=top_k,
+        service_filter=service_filter,
+        store=store,
     )
 
 
-def _nodes_to_results(nodes: list[NodeWithScore]) -> list[SearchResult]:
-    """Map LlamaIndex nodes into the SearchResult shape — one common currency
-    for /chat, context formatting and any future A/B."""
+def _documents_to_results(documents: list[Document]) -> list[SearchResult]:
+    """Map Haystack Documents into the SearchResult shape — one common
+    currency for /chat, build_context and any future A/B."""
     return [
         SearchResult(
-            service_name=n.node.metadata.get("service_name", "?"),
-            doc_file_path=n.node.metadata.get("doc_file_path", "?"),
-            chunk_index=int(n.node.metadata.get("chunk_index", -1)),
-            content=n.node.get_content(),
-            similarity_score=float(n.score or 0.0),
+            service_name=doc.meta.get("service_name", "?"),
+            doc_file_path=doc.meta.get("doc_file_path", "?"),
+            chunk_index=int(doc.meta.get("chunk_index", -1)),
+            content=doc.content or "",
+            similarity_score=float(doc.score or 0.0),
         )
-        for n in nodes
+        for doc in documents
     ]
 
 
@@ -141,34 +124,38 @@ async def aquery(
     retrieve_mode: Literal["vector", "graph", "hybrid"] = "vector",
 ) -> tuple[str, list[SearchResult]]:
     """
-    Library-first query: retriever + ResponseSynthesizer + shared LLM client, all LlamaIndex.
+    Library-first query: Haystack retrieval branch + the single shared LLM synthesis.
 
     retrieve_mode selects the retrieval branch: "vector" (Qdrant), "graph"
-    (PropertyGraphIndex/Neo4j) or "hybrid" (vector chunks first, Neo4j graph
-    facts appended to the chunk text); synthesis and this fallback are shared.
-    When the local LLM is offline, retrieval still answers: the citation-formatted
-    raw context is returned instead.
+    (Neo4j v2 graph) or "hybrid" (vector chunks first, Neo4j graph facts
+    appended to the chunk text). Retrieval errors propagate to the caller;
+    only an LLM synthesis failure falls back to the raw citation-formatted
+    context, so retrieval still answers when the local LLM is offline.
     """
-    engine = build_query_engine(
+    pipeline = _build_pipeline(
+        retrieve_mode=retrieve_mode,
         top_k=top_k,
         service_filter=service_filter,
         collection_name=collection_name,
-        retrieve_mode=retrieve_mode,
     )
+    inputs: dict[str, dict[str, Any]] = {"text_embedder": {"text": question}}
+    if retrieve_mode == "graph":
+        # The graph retriever also consumes the raw query text (keyword
+        # scoring) alongside the embedding from the shared text_embedder.
+        inputs["graph_retriever"] = {"query_text": question}
+
+    result = await asyncio.to_thread(pipeline.run, inputs)
+    documents = result[_FINAL_COMPONENTS[retrieve_mode]]["documents"]
+    sources = _documents_to_results(documents)
+    context = build_context(sources)
+
     try:
-        response = await engine.aquery(question)
-        sources = _nodes_to_results(list(response.source_nodes))
-        return str(response), sources
-    except Exception as exc:  # noqa: BLE001 - any synthesis failure must fall back to raw retrieved context
-        logger.info(f"LlamaIndex LLM call failed ({exc}); falling back to retrieved context.")
-        # All three branches return RetrieverQueryEngine; the union in the
-        # build_query_engine signature exists only because as_query_engine's
-        # stub returns the BaseQueryEngine it wraps.
-        nodes = await cast(RetrieverQueryEngine, engine).retriever.aretrieve(question)
-        sources = _nodes_to_results(list(nodes))
-        context = build_context(sources)
+        prompt = build_chat_prompt().run(query=question, context=context)["prompt"]
+        reply = get_chat_model().run(messages=prompt)["replies"][-1].text or ""
+    except Exception as exc:  # noqa: BLE001 - synthesis failure must fall back to the raw retrieved context
+        logger.info("LLM call failed (%s); falling back to retrieved context.", exc)
         reply = (
-            "*(Note: Local LLM was unreachable; LlamaIndex retrieval shown directly)*\n\n"
+            "*(Note: Local LLM was unreachable; retrieved context shown directly)*\n\n"
             + context
         )
-        return reply, sources
+    return reply, sources
