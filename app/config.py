@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Using asyncpg driver for asynchronous database I/O
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/rag_docs_db"
 
-    # Qdrant vector store (single collection used by the LlamaIndex pipeline)
+    # Qdrant vector store (single collection used by the Haystack pipeline)
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION: str = "doc_chunks"
 

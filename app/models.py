@@ -49,7 +49,7 @@ class ServiceDocumentationChunk(Base):
     """
     Represents a discrete semantic chunk of a microservice's documentation.
     This row is the source of truth for chunk TEXT only; the embedding lives
-    in Qdrant as a point with the SAME uuid id, indexed by the LlamaIndex
+    in Qdrant as a point with the SAME uuid id, indexed by the Haystack
     pipeline (see app/vector_rag.py), and the graph lives in Neo4j via
     app/graph_rag.py.
     """

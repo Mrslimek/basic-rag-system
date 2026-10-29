@@ -13,7 +13,7 @@ from app.config import get_settings
 settings = get_settings()
 
 # Engine creation: Postgres owns documents/chunks/graph tables only.
-# Vectors live in Qdrant, written by the LlamaIndex pipeline (app/vector_rag.py),
+# Vectors live in Qdrant, written by the Haystack pipeline (app/vector_rag.py),
 # so no pgvector codecs are registered here.
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
