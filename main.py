@@ -53,9 +53,9 @@ class ChatRequest(BaseModel):
         None, description="Optional microservice name to narrow vector search (e.g., 'billing')"
     )
     top_k: int = Field(default=3, ge=1, le=10, description="Number of context passages to retrieve")
-    retrieve_mode: Literal["vector", "graph", "hybrid"] = Field(
+    retrieve_mode: Literal["vector", "graph", "hybrid", "agent"] = Field(
         default="vector",
-        description="RAG branch: 'vector' = Qdrant semantic search; 'graph' = knowledge-graph retrieval over Neo4j (entities and relations, no LLM in retrieval); 'hybrid' = vector chunks with Neo4j graph facts appended to their context",
+        description="RAG branch: 'vector' = Qdrant semantic search; 'graph' = knowledge-graph retrieval over Neo4j (entities and relations, no LLM in retrieval); 'hybrid' = vector chunks with Neo4j graph facts appended to their context; 'agent' = pydantic-ai tool loop where the model calls search_docs/graph_lookup/read_chunk itself and sources are mapped from its tool-call transcript",
     )
 
 

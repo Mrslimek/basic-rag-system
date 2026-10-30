@@ -28,11 +28,11 @@ with st.sidebar:
     top_k = st.slider("Passages to retrieve (top_k)", min_value=1, max_value=10, value=3)
     rag_mode = st.radio(
         "RAG mode",
-        options=["vector", "graph", "hybrid"],
+        options=["vector", "graph", "hybrid", "agent"],
         index=0,
-        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval over Neo4j (entities and relations, no LLM in retrieval); hybrid = vector chunks with Neo4j graph facts appended to the context",
+        help="vector = embeddings search in Qdrant; graph = knowledge-graph retrieval over Neo4j (entities and relations, no LLM in retrieval); hybrid = vector chunks with Neo4j graph facts appended to the context; agent = the LLM plans the search itself via pydantic-ai tool calls (search_docs, graph_lookup, read_chunk)",
     )
-    st.caption("vector finds passages by embedding similarity; graph follows relationships in the knowledge graph; hybrid combines both (vector-first, graph facts appended).")
+    st.caption("vector finds passages by embedding similarity; graph follows relationships in the knowledge graph; hybrid combines both (vector-first, graph facts appended); agent lets the model decide which tool to call per step (needs a tool-calling LLM endpoint).")
 
 # Initialize chat history in Streamlit session state
 if "messages" not in st.session_state:

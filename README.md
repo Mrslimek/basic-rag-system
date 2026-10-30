@@ -19,9 +19,9 @@ Qdrant (doc_chunks)           = one point per chunk, point id = chunk UUID, so a
 Neo4j (knowledge graph)       = Chunk nodes + Entity nodes (typed labels,
                                 384-dim embeddings) + typed relations, built
                                 on demand from Postgres chunks (app/graph_rag).
-/app/chat { retrieve_mode }   = vector | graph | hybrid, dispatched in
-                                app/query.py; all branches share ONE LLM
-                                synthesis path.
+/app/chat { retrieve_mode }   = vector | graph | hybrid | agent, dispatched
+                                in app/query.py; all non-agent branches
+                                share ONE LLM synthesis path.
 ```
 
 Key decisions:
@@ -106,8 +106,13 @@ classDef component text-align:center;
 app/vector_rag.py — Qdrant rebuild + vector retrieval pipeline
 app/graph_rag.py — Neo4j v2 graph build, extraction schema, graph retrieval
 app/hybrid_rag.py — vector-first hybrid with MENTIONS fact expansion
+app/agent_rag.py — pydantic-ai agent branch (tool loop + source mapping)
 app/query.py — shared synthesis, retrieve_mode dispatch, /chat entry
 ```
+
+### Agent retrieve mode
+
+`retrieve_mode="agent"` swaps the fixed Haystack pipeline for a `pydantic-ai` tool loop (`app/agent_rag.py`): the model itself decides per step which read-only tool to call — `search_docs` (Qdrant retrieval via the same `app.vector_rag` factories), `graph_lookup` (Neo4j entities + triplets via `app.graph_rag`) or `read_chunk` (full chunk text from Postgres) — then writes the answer grounded in the tool output. Sources are mapped deterministically from the tool-call transcript (`read_chunk` call args, then `search_docs` result lines, deduped, capped at 5), never from the model's own "Sources:" line, so provenance is not hallucinated. The model endpoint is `LLM_API_BASE`/`LLM_MODEL` from `.env`; it must emit native tool calls — the local llama.cpp `Qwen2.5-Coder-1.5B` build does not (it answers or prints JSON instead of `tool_calls`), so point the agent runs at a tool-calling endpoint.
 
 ---
 

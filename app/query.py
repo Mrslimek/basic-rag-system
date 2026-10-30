@@ -12,6 +12,10 @@ One synthesis path serves three retrieval branches, selected by
            expansion appends each chunk's graph facts to its text — built by
            app/hybrid_rag.py behind the same lazy import; Neo4j errors
            degrade to the plain vector documents.
+  agent  = a pydantic-ai tool loop (app/agent_rag.py, lazily imported):
+           the model itself calls search_docs/graph_lookup/read_chunk over
+           the live stack and sources are mapped from its tool-call
+           transcript; needs a tool-calling model endpoint.
 All branches return chunk Documents with the same provenance metadata and
 score currency and share ONE synthesis path here (SearchResult ->
 build_context -> ChatPromptBuilder -> OpenAIChatGenerator), so a
@@ -121,17 +125,31 @@ async def aquery(
     top_k: int = 4,
     service_filter: str | None = None,
     collection_name: str | None = None,
-    retrieve_mode: Literal["vector", "graph", "hybrid"] = "vector",
+    retrieve_mode: Literal["vector", "graph", "hybrid", "agent"] = "vector",
 ) -> tuple[str, list[SearchResult]]:
     """
     Library-first query: Haystack retrieval branch + the single shared LLM synthesis.
 
     retrieve_mode selects the retrieval branch: "vector" (Qdrant), "graph"
-    (Neo4j v2 graph) or "hybrid" (vector chunks first, Neo4j graph facts
-    appended to the chunk text). Retrieval errors propagate to the caller;
-    only an LLM synthesis failure falls back to the raw citation-formatted
-    context, so retrieval still answers when the local LLM is offline.
+    (Neo4j v2 graph), "hybrid" (vector chunks first, Neo4j graph facts
+    appended to the chunk text) or "agent" (pydantic-ai tool loop, sources
+    mapped from the tool-call transcript). Retrieval errors propagate to the
+    caller; only an LLM synthesis failure falls back to the raw
+    citation-formatted context, so retrieval still answers when the local LLM
+    is offline.
     """
+    if retrieve_mode == "agent":
+        from app import agent_rag
+
+        # The agent loop is fully synchronous (tools + run_sync); keep it off
+        # the event loop like every other blocking branch.
+        return await asyncio.to_thread(
+            agent_rag.run_agent,
+            question,
+            top_k=top_k,
+            service_filter=service_filter,
+            collection_name=collection_name,
+        )
     pipeline = _build_pipeline(
         retrieve_mode=retrieve_mode,
         top_k=top_k,
