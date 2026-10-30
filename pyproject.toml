@@ -21,6 +21,7 @@ dependencies = [
     "haystack-ai>=3.4.1",
     "qdrant-haystack>=13.1.0",
     "fastembed-haystack>=3.0.0",
+    "pydantic-ai>=2.63.0",
 ]
 
 [project.optional-dependencies]
